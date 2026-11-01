@@ -15,7 +15,7 @@ import org.lwjgl.opengl.GL30C;
  * and Beer-Lambert physical absorption for oceans and rivers.
  */
 public class WaterTranslucentPass implements IShaderPass {
-    private boolean enabled = true;
+    private boolean enabled = false;
     private ShaderProgram waterShader;
 
     @Override

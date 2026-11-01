@@ -16,7 +16,7 @@ NSP is a dedicated, GPU-driven shader pipeline engineered specifically for **Nvi
 1. **DO NOT USE OPTIFINE / IRIS CONVENTIONS:**
    * **Do NOT** use OptiFine/Iris uniform names (e.g., `gbufferModelView`, `gbufferProjection`, `shadowModelView`, `shadowProjection`, `colortex0`..`colortex15`, `sunPosition`, `heldItemId`, `isEyeInWater`, etc.).
    * **Do NOT** write legacy OptiFine `.vsh`/`.fsh` files or composite program chains with `#define` configurations.
-   * **DO** use the exact `SceneUniforms` block (`std140`, binding = 0) documented below.
+   * **DO** use the exact `SceneUniforms` block (`std140`, binding = 3) documented below (binding point 0 is reserved for Nvidium internal GPU command pointers).
 2. **GLSL VERSION & EXTENSIONS:**
    * All shaders must start with `#version 460 core`.
    * For mesh shaders, require `#extension GL_NV_mesh_shader : require` and `#extension GL_NV_gpu_shader5 : require`.
@@ -28,12 +28,12 @@ NSP is a dedicated, GPU-driven shader pipeline engineered specifically for **Nvi
 
 ---
 
-## 2. Global Scene Uniform Buffer (`std140`, binding = 0)
+## 2. Global Scene Uniform Buffer (`std140`, binding = 3)
 
 All shaders have access to the global scene state through this uniform block. **Always copy this exact declaration into generated shaders:**
 
 ```glsl
-layout(std140, binding = 0) uniform SceneUniforms {
+layout(std140, binding = 3) uniform SceneUniforms {
     mat4  u_ViewMatrix;          // Camera view transform
     mat4  u_ProjMatrix;          // Camera projection transform
     mat4  u_ViewProjMatrix;      // Combined View * Projection
@@ -158,7 +158,8 @@ float sampleCascadedShadow(vec3 worldPos, float viewDist) {
 
     // Discard out-of-bounds coordinates
     if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
-        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 || shadowCoord.z > 1.0) {
+        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
+        shadowCoord.z > 1.0) {
         return 1.0;
     }
 

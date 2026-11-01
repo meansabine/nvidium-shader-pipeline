@@ -20,7 +20,7 @@ import java.nio.ByteBuffer;
  * Bound to Uniform Buffer Binding Point 0 across all shader stages.
  */
 public class SceneUniforms {
-    public static final int BINDING_POINT = 0;
+    public static final int BINDING_POINT = 3;
     public static final int BUFFER_SIZE = 1024;
 
     private int uboId = 0;

@@ -46,30 +46,56 @@ public class PostProcessPass implements IShaderPass {
         if (!enabled) return;
 
         DeferredLightingPass lightingPass = (DeferredLightingPass) pipeline.getPass("deferred_lighting");
-        if (lightingPass == null || tonemapShader == null) return;
-
-        // Restore target back to Minecraft's main framebuffer
         RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+        int targetFbo = mcTarget != null ? mcTarget.frameBufferId : 0;
+        int width = pipeline.getWidth();
+        int height = pipeline.getHeight();
+
+        // 1. Copy depth from G-Buffer to Minecraft's mainRenderTarget
+        // This ensures entities, mobs, and particles properly depth-test against the rendered terrain!
+        GL30C.glBindFramebuffer(GL30C.GL_READ_FRAMEBUFFER, pipeline.getGbuffer().getFboId());
+        GL30C.glBindFramebuffer(GL30C.GL_DRAW_FRAMEBUFFER, targetFbo);
+        GL30C.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL11C.GL_DEPTH_BUFFER_BIT, GL11C.GL_NEAREST);
+
+        // 2. Render lit color into Minecraft's mainRenderTarget
         if (mcTarget != null) {
             mcTarget.bindWrite(true);
         } else {
             GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, 0);
+            GL11C.glViewport(0, 0, width, height);
         }
 
-        GL11C.glViewport(0, 0, pipeline.getWidth(), pipeline.getHeight());
         GL11C.glDisable(GL11C.GL_DEPTH_TEST);
         GL11C.glDepthMask(false);
         GL11C.glDisable(GL11C.GL_BLEND);
 
-        tonemapShader.bind();
+        if (tonemapShader != null && lightingPass != null) {
+            tonemapShader.bind();
 
-        // Bind HDR Color texture: Unit 0
-        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
-        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, lightingPass.getHdrColorTexture());
-        tonemapShader.setUniform1i("u_HdrColorTexture", 0);
+            // Bind HDR Color texture: Unit 0
+            GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+            GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, lightingPass.getHdrColorTexture());
+            tonemapShader.setUniform1i("u_HdrColorTexture", 0);
 
-        FullscreenQuad.render();
-        ShaderProgram.unbind();
+            FullscreenQuad.render();
+            ShaderProgram.unbind();
+        } else {
+            // Robust Fallback: Blit HDR FBO (or G-Buffer Attachment 0) directly
+            int sourceFbo = (lightingPass != null && lightingPass.getHdrFbo() != 0)
+                    ? lightingPass.getHdrFbo()
+                    : pipeline.getGbuffer().getFboId();
+            GL30C.glBindFramebuffer(GL30C.GL_READ_FRAMEBUFFER, sourceFbo);
+            GL30C.glBindFramebuffer(GL30C.GL_DRAW_FRAMEBUFFER, targetFbo);
+            GL30C.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL11C.GL_COLOR_BUFFER_BIT, GL11C.GL_NEAREST);
+        }
+
+        // Restore OpenGL state for Minecraft's entity/translucent rendering
+        if (mcTarget != null) {
+            mcTarget.bindWrite(false);
+        }
+        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
+        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
+        GL11C.glDepthMask(true);
     }
 
     @Override

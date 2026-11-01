@@ -71,11 +71,11 @@ The pipeline executes in six distinct, highly optimized stages every frame:
 
 ## 3. Data Formats & GPU Memory Layouts
 
-### 3.1 The Scene Uniform Block (`std140`, binding = 0)
-Shared across all vertex, mesh, fragment, and compute shaders via binding point `0`:
+### 3.1 The Scene Uniform Block (`std140`, binding = 3)
+Shared across all vertex, mesh, fragment, and compute shaders via binding point `3` (binding point 0 is reserved for Nvidium internal GPU command pointers):
 
 ```glsl
-layout(std140, binding = 0) uniform SceneUniforms {
+layout(std140, binding = 3) uniform SceneUniforms {
     mat4  u_ViewMatrix;          // Camera view transform
     mat4  u_ProjMatrix;          // Camera projection transform
     mat4  u_ViewProjMatrix;      // Combined View * Projection

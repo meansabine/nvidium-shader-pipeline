@@ -1,7 +1,7 @@
-// Standard Scene Uniform Buffer (std140, binding = 0)
+// Standard Scene Uniform Buffer (std140, binding = 3)
 // Must exactly match net.nvidium.shaders.pipeline.uniforms.SceneUniforms
 
-layout(std140, binding = 0) uniform SceneUniforms {
+layout(std140, binding = 3) uniform SceneUniforms {
     mat4 u_ViewMatrix;
     mat4 u_ProjMatrix;
     mat4 u_ViewProjMatrix;

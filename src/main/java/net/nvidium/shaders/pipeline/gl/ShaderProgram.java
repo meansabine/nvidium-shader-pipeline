@@ -6,19 +6,16 @@ import net.minecraft.server.packs.resources.Resource;
 import net.nvidium.shaders.NvidiumShaderPipeline;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL20C;
-import org.lwjgl.opengl.GL43C;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.stream.Collectors;
+import java.util.*;
 
 /**
  * Modern OpenGL shader program supporting standard pipeline stages
  * as well as NVIDIA Mesh & Task shaders (GL_NV_mesh_shader).
+ * Includes recursive pre-processing of #include and #import directives.
  */
 public class ShaderProgram {
     public static final int GL_MESH_SHADER_NV = 0x864E;
@@ -109,17 +106,100 @@ public class ShaderProgram {
         return name;
     }
 
-    private static String loadShaderSource(ResourceLocation location) {
+    public static String loadShaderSource(ResourceLocation location) {
+        return loadShaderSource(location, new HashSet<>());
+    }
+
+    private static String loadShaderSource(ResourceLocation location, Set<ResourceLocation> visited) {
+        if (!visited.add(location)) {
+            return "// Cycle omitted: " + location + "\n";
+        }
+
         try {
-            Optional<Resource> res = Minecraft.getInstance().getResourceManager().getResource(location);
+            Optional<Resource> res = resolveResource(location);
             if (res.isPresent()) {
+                StringBuilder builder = new StringBuilder();
                 try (BufferedReader reader = new BufferedReader(new InputStreamReader(res.get().open(), StandardCharsets.UTF_8))) {
-                    return reader.lines().collect(Collectors.joining("\n"));
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        String trimmed = line.trim();
+                        if (trimmed.startsWith("#include") || trimmed.startsWith("#import")) {
+                            int start = trimmed.indexOf('<');
+                            int end = trimmed.indexOf('>');
+                            if (start == -1 || end == -1) {
+                                start = trimmed.indexOf('"');
+                                end = trimmed.lastIndexOf('"');
+                            }
+                            if (start != -1 && end != -1 && end > start) {
+                                String includeTarget = trimmed.substring(start + 1, end).trim();
+                                ResourceLocation incLoc = parseIncludeLocation(location, includeTarget);
+                                String includedContent = loadShaderSource(incLoc, visited);
+                                if (includedContent != null) {
+                                    builder.append("// --- Begin Included: ").append(includeTarget).append(" ---\n");
+                                    builder.append(includedContent).append("\n");
+                                    builder.append("// --- End Included: ").append(includeTarget).append(" ---\n");
+                                    continue;
+                                } else {
+                                    NvidiumShaderPipeline.LOGGER.warn("Failed to resolve shader include: {}", includeTarget);
+                                }
+                            }
+                        }
+                        builder.append(line).append("\n");
+                    }
                 }
+                return builder.toString();
+            } else {
+                NvidiumShaderPipeline.LOGGER.error("Shader resource not found: {}", location);
             }
         } catch (Exception e) {
-            NvidiumShaderPipeline.LOGGER.error("Error loading shader resource: {}", location, e);
+            NvidiumShaderPipeline.LOGGER.error("Error reading shader: {}", location, e);
         }
         return null;
+    }
+
+    private static Optional<Resource> resolveResource(ResourceLocation loc) {
+        var rm = Minecraft.getInstance().getResourceManager();
+        var direct = rm.getResource(loc);
+        if (direct.isPresent()) return direct;
+
+        // Try prefixing "shaders/" if omitted
+        if (!loc.getPath().startsWith("shaders/")) {
+            var withShaders = rm.getResource(ResourceLocation.fromNamespaceAndPath(loc.getNamespace(), "shaders/" + loc.getPath()));
+            if (withShaders.isPresent()) return withShaders;
+        }
+        return Optional.empty();
+    }
+
+    private static ResourceLocation parseIncludeLocation(ResourceLocation parent, String includePath) {
+        String namespace = parent.getNamespace();
+        String path = includePath;
+        if (includePath.contains(":")) {
+            String[] parts = includePath.split(":", 2);
+            namespace = parts[0];
+            path = parts[1];
+        } else {
+            String parentPath = parent.getPath();
+            int slash = parentPath.lastIndexOf('/');
+            String dir = slash != -1 ? parentPath.substring(0, slash + 1) : "";
+            path = dir + path;
+        }
+        path = normalizePath(path);
+        return ResourceLocation.fromNamespaceAndPath(namespace, path);
+    }
+
+    private static String normalizePath(String path) {
+        String[] parts = path.split("/");
+        List<String> list = new ArrayList<>();
+        for (String p : parts) {
+            if (p.isEmpty() || p.equals(".")) continue;
+            if (p.equals("..")) {
+                if (!list.isEmpty()) {
+                    list.remove(list.size() - 1);
+                }
+            } else {
+                list.add(p);
+            }
+        }
+        return String.join("/", list);
     }
 }

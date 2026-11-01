@@ -1,9 +1,9 @@
 #version 460 core
 
 // ============================================================================
-// Global Scene Uniform Buffer (std140, binding = 0)
+// Global Scene Uniform Buffer (std140, binding = 3)
 // ============================================================================
-layout(std140, binding = 0) uniform SceneUniforms {
+layout(std140, binding = 3) uniform SceneUniforms {
     mat4  u_ViewMatrix;          // Camera view transform
     mat4  u_ProjMatrix;          // Camera projection transform
     mat4  u_ViewProjMatrix;      // Combined View * Projection
@@ -228,20 +228,37 @@ void main() {
     vec4 normalMetallic  = texture(u_NormalMetallic, uv);
     vec4 lightEmission   = texture(u_LightEmission, uv);
 
-    // Convert sRGB Albedo to Linear space for physical lighting
-    vec3 albedo     = pow(albedoRoughness.rgb, vec3(2.2));
-    float roughness = clamp(albedoRoughness.a, 0.04, 1.0);
-    vec3 N          = normalize(normalMetallic.rgb * 2.0 - 1.0);
-    float metallic  = clamp(normalMetallic.a, 0.0, 1.0);
-
-    float blockLight = lightEmission.r; // [0.0, 1.0]
-    float skyLight   = lightEmission.g; // [0.0, 1.0]
-    float emission   = lightEmission.b; // LabPBR emissive
+    // Fallback A: When rendered with Nvidium's default shader, Attachment 0 contains
+    // pre-lit vanilla diffuse, while normal and light buffers are unwritten (0).
+    // In that case, output the pre-lit color directly so terrain is always 100% visible!
+    if (length(lightEmission.rg) < 0.001 && length(normalMetallic.xyz) < 0.01) {
+        outHdrColor = vec4(albedoRoughness.rgb, 1.0);
+        return;
+    }
 
     // Reconstruct geometry & view vectors
     vec3 worldPos = reconstructWorldPos(uv, depth);
     vec3 V = normalize(u_CameraPos.xyz - worldPos);
     float viewDist = length(u_CameraPos.xyz - worldPos);
+
+    // Fallback B: If normal texture is unwritten, derive geometric normal from screen derivatives
+    vec3 N;
+    if (length(normalMetallic.xyz) < 0.01) {
+        vec3 dX = dFdx(worldPos);
+        vec3 dY = dFdy(worldPos);
+        N = normalize(cross(dY, dX));
+    } else {
+        N = normalize(normalMetallic.rgb * 2.0 - 1.0);
+    }
+
+    // Convert sRGB Albedo to Linear space for physical lighting
+    vec3 albedo     = pow(albedoRoughness.rgb, vec3(2.2));
+    float roughness = clamp(albedoRoughness.a, 0.04, 1.0);
+    float metallic  = clamp(normalMetallic.a, 0.0, 1.0);
+
+    float blockLight = lightEmission.r; // [0.0, 1.0]
+    float skyLight   = lightEmission.g; // [0.0, 1.0]
+    float emission   = lightEmission.b; // LabPBR emissive
 
     // ========================================================================
     // 1. Direct Sunlight (Cook-Torrance GGX + Cascaded Soft PCF Shadows)

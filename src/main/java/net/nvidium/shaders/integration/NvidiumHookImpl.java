@@ -103,17 +103,24 @@ public class NvidiumHookImpl implements INvidiumShaderHook {
         if (!pipeline.isEnabled()) return;
 
         Minecraft mc = Minecraft.getInstance();
-        // Bind LabPBR Normal Atlas (unit 2) and Specular Atlas (unit 3) if present
+        var rm = mc.getResourceManager();
+        // Bind LabPBR Normal Atlas (unit 2) and Specular Atlas (unit 3) only if actually present
         try {
-            var normalTex = mc.getTextureManager().getTexture(ResourceLocation.parse("textures/atlas/blocks_n.png"));
-            if (normalTex != null) {
-                GlStateManager._activeTexture(33984 + 2); // GL_TEXTURE2
-                GlStateManager._bindTexture(normalTex.getId());
+            var normalLoc = ResourceLocation.parse("textures/atlas/blocks_n.png");
+            if (rm.getResource(normalLoc).isPresent()) {
+                var normalTex = mc.getTextureManager().getTexture(normalLoc);
+                if (normalTex != null) {
+                    GlStateManager._activeTexture(33984 + 2); // GL_TEXTURE2
+                    GlStateManager._bindTexture(normalTex.getId());
+                }
             }
-            var specTex = mc.getTextureManager().getTexture(ResourceLocation.parse("textures/atlas/blocks_s.png"));
-            if (specTex != null) {
-                GlStateManager._activeTexture(33984 + 3); // GL_TEXTURE3
-                GlStateManager._bindTexture(specTex.getId());
+            var specLoc = ResourceLocation.parse("textures/atlas/blocks_s.png");
+            if (rm.getResource(specLoc).isPresent()) {
+                var specTex = mc.getTextureManager().getTexture(specLoc);
+                if (specTex != null) {
+                    GlStateManager._activeTexture(33984 + 3); // GL_TEXTURE3
+                    GlStateManager._bindTexture(specTex.getId());
+                }
             }
         } catch (Exception ignored) {}
     }
@@ -133,34 +140,40 @@ public class NvidiumHookImpl implements INvidiumShaderHook {
         if (fogPass != null && fogPass.isEnabled()) {
             fogPass.execute(pipeline, currentContext);
         }
+
+        // 3. Resolve Lit Scene & Copy Depth to Minecraft's mainRenderTarget
+        // This ensures the terrain is fully visible and entities depth-test properly against it
+        var postPass = (PostProcessPass) pipeline.getPass("post_process");
+        if (postPass != null && postPass.isEnabled()) {
+            postPass.execute(pipeline, currentContext);
+        }
     }
 
     @Override
     public void onPreRenderTranslucent(int regionCount, long commandAddr) {
         if (!pipeline.isEnabled()) return;
 
-        // Bind HDR Color target for translucent rasterization
-        var lightingPass = (DeferredLightingPass) pipeline.getPass("deferred_lighting");
-        if (lightingPass != null) {
-            GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, lightingPass.getHdrFbo());
+        // Ensure Minecraft's mainRenderTarget is bound for translucent chunk rasterization
+        var mcTarget = Minecraft.getInstance().getMainRenderTarget();
+        if (mcTarget != null) {
+            mcTarget.bindWrite(false);
         }
+        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
+        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
+        GL11C.glDepthMask(false);
     }
 
     @Override
     public void onPostRenderTranslucent() {
         if (!pipeline.isEnabled() || currentContext == null) return;
 
-        // 1. Execute Water Surface Shading (Screen-Space Reflections & Refraction)
+        // Execute Water Surface Shading if enabled
         var waterPass = (WaterTranslucentPass) pipeline.getPass("water_translucent");
         if (waterPass != null && waterPass.isEnabled()) {
             waterPass.execute(pipeline, currentContext);
         }
 
-        // 2. Execute Post-Processing & Tone Mapping (ACES, Bloom, Blit to Screen)
-        var postPass = (PostProcessPass) pipeline.getPass("post_process");
-        if (postPass != null && postPass.isEnabled()) {
-            postPass.execute(pipeline, currentContext);
-        }
+        GL11C.glDepthMask(true);
     }
 
     @Override
