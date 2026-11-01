@@ -51,11 +51,13 @@ public class PostProcessPass implements IShaderPass {
         int width = pipeline.getWidth();
         int height = pipeline.getHeight();
 
-        // 1. Copy depth from G-Buffer to Minecraft's mainRenderTarget
-        // This ensures entities, mobs, and particles properly depth-test against the rendered terrain!
-        GL30C.glBindFramebuffer(GL30C.GL_READ_FRAMEBUFFER, pipeline.getGbuffer().getFboId());
-        GL30C.glBindFramebuffer(GL30C.GL_DRAW_FRAMEBUFFER, targetFbo);
-        GL30C.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL11C.GL_DEPTH_BUFFER_BIT, GL11C.GL_NEAREST);
+        // 1. If G-Buffer is using a separate depth buffer from mcTarget, copy depth
+        // When G-Buffer attaches mcTarget's depth buffer directly, mcTarget already has the terrain depth!
+        if (mcTarget != null && pipeline.getGbuffer().getDepthTex() != mcTarget.getDepthTextureId()) {
+            GL30C.glBindFramebuffer(GL30C.GL_READ_FRAMEBUFFER, pipeline.getGbuffer().getFboId());
+            GL30C.glBindFramebuffer(GL30C.GL_DRAW_FRAMEBUFFER, targetFbo);
+            GL30C.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL11C.GL_DEPTH_BUFFER_BIT, GL11C.GL_NEAREST);
+        }
 
         // 2. Render lit color into Minecraft's mainRenderTarget
         if (mcTarget != null) {

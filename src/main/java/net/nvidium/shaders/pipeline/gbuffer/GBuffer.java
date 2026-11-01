@@ -1,5 +1,7 @@
 package net.nvidium.shaders.pipeline.gbuffer;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import net.minecraft.client.Minecraft;
 import org.lwjgl.opengl.*;
 
 import java.nio.ByteBuffer;
@@ -12,7 +14,7 @@ import java.nio.IntBuffer;
  * - Attachment 0 (GL_RGBA16F): Base Albedo (RGB) + Roughness (A)
  * - Attachment 1 (GL_RGBA16F): Encoded Normal (RGB) + Metalness/PBR Flags (A)
  * - Attachment 2 (GL_RGBA16F): Lightmap UVs (RG) + Emissive (B) + Material ID (A)
- * - Depth (GL_DEPTH_COMPONENT32F): Scene Depth
+ * - Depth (GL_DEPTH_COMPONENT24): Scene Depth (shares mcTarget depth texture directly)
  */
 public class GBuffer {
     private int fboId = 0;
@@ -20,6 +22,7 @@ public class GBuffer {
     private int normalMetallicTex = 0;
     private int lightEmissionTex = 0;
     private int depthTex = 0;
+    private int attachedDepthTex = 0;
 
     private int width;
     private int height;
@@ -46,10 +49,10 @@ public class GBuffer {
         lightEmissionTex = createTexture(GL30C.GL_RGBA16F, GL11C.GL_RGBA, GL11C.GL_FLOAT, GL11C.GL_NEAREST);
         GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_COLOR_ATTACHMENT2, GL11C.GL_TEXTURE_2D, lightEmissionTex, 0);
 
-        // 4. Depth buffer (DEPTH32F for maximum precision at long render distances)
+        // 4. Depth buffer (DEPTH24 matching Minecraft's internal depth format)
         depthTex = GL11C.glGenTextures();
         GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, depthTex);
-        GL11C.glTexImage2D(GL11C.GL_TEXTURE_2D, 0, GL30C.GL_DEPTH_COMPONENT32F, width, height, 0, GL11C.GL_DEPTH_COMPONENT, GL11C.GL_FLOAT, (ByteBuffer) null);
+        GL11C.glTexImage2D(GL11C.GL_TEXTURE_2D, 0, GL14C.GL_DEPTH_COMPONENT24, width, height, 0, GL11C.GL_DEPTH_COMPONENT, GL11C.GL_UNSIGNED_INT, (ByteBuffer) null);
         GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_MIN_FILTER, GL11C.GL_NEAREST);
         GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_MAG_FILTER, GL11C.GL_NEAREST);
         GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_WRAP_S, GL12C.GL_CLAMP_TO_EDGE);
@@ -85,6 +88,15 @@ public class GBuffer {
 
     public void bindWrite() {
         GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, fboId);
+        // Attach Minecraft's main depth buffer directly so terrain depth writes straight into mcTarget
+        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+        if (mcTarget != null && mcTarget.getDepthTextureId() > 0) {
+            int mcDepth = mcTarget.getDepthTextureId();
+            if (this.attachedDepthTex != mcDepth) {
+                this.attachedDepthTex = mcDepth;
+                GL30C.glFramebufferTexture2D(GL30C.GL_FRAMEBUFFER, GL30C.GL_DEPTH_ATTACHMENT, GL11C.GL_TEXTURE_2D, mcDepth, 0);
+            }
+        }
         GL11C.glViewport(0, 0, width, height);
     }
 
@@ -109,7 +121,7 @@ public class GBuffer {
 
         // Bind Depth
         GL13C.glActiveTexture(GL13C.GL_TEXTURE0 + startUnit + 3);
-        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, depthTex);
+        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, getDepthTex());
     }
 
     public void resize(int newWidth, int newHeight) {
@@ -121,6 +133,7 @@ public class GBuffer {
     }
 
     public void destroy() {
+        attachedDepthTex = 0;
         if (fboId != 0) {
             GL30C.glDeleteFramebuffers(fboId);
             fboId = 0;
@@ -147,7 +160,7 @@ public class GBuffer {
     public int getAlbedoRoughnessTex() { return albedoRoughnessTex; }
     public int getNormalMetallicTex() { return normalMetallicTex; }
     public int getLightEmissionTex() { return lightEmissionTex; }
-    public int getDepthTex() { return depthTex; }
+    public int getDepthTex() { return attachedDepthTex > 0 ? attachedDepthTex : depthTex; }
     public int getWidth() { return width; }
     public int getHeight() { return height; }
 }

@@ -87,7 +87,7 @@ public class WaterTranslucentPass implements IShaderPass {
         try {
             if (waterShader != null) waterShader.destroy();
             waterShader = new ShaderProgram("WaterTranslucent")
-                    .attachStage(GL20C.GL_VERTEX_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/common/fullscreen.vert"))
+                    .attachStage(GL20C.GL_VERTEX_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/water/water_surface.vert"))
                     .attachStage(GL20C.GL_FRAGMENT_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/water/water_surface.frag"))
                     .link();
         } catch (Exception e) {
