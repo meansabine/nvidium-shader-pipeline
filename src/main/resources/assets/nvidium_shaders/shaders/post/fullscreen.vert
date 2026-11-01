@@ -1,5 +1,10 @@
 #version 460 core
 
+// ============================================================================
+// Nvidium Shader Pipeline (NSP) - Fullscreen Triangle Vertex Shader
+// Generates a clip-space triangle covering [-1, 1] without VBO bindings.
+// ============================================================================
+
 layout(location = 0) out vec2 v_Uv;
 
 void main() {

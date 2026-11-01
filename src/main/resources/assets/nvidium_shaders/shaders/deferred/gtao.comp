@@ -1,5 +1,10 @@
 #version 460 core
 
+// ============================================================================
+// Nvidium Shader Pipeline (NSP) - Ground Truth Ambient Occlusion (GTAO) Compute
+// Horizon-based screen-space ambient occlusion with IGN spatial-temporal jitter.
+// ============================================================================
+
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(std140, binding = 3) uniform SceneUniforms {
@@ -24,9 +29,11 @@ layout(std140, binding = 3) uniform SceneUniforms {
 
 layout(binding = 1) uniform sampler2D u_NormalMetallic;
 layout(binding = 3) uniform sampler2D u_Depth;
-layout(r16f, binding = 0) uniform writeonly image2D u_AoOutput;
+layout(binding = 0, r8) uniform writeonly image2D u_AoOutput;
 
 const float PI = 3.14159265359;
+const int   GTAO_SLICES = 3;
+const int   GTAO_STEPS  = 6;
 
 vec3 reconstructViewPos(vec2 uv, float depth) {
     vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
@@ -43,7 +50,8 @@ float interleavedGradientNoise(vec2 pixelCoord) {
 
 void main() {
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    if (pixel.x >= int(u_ScreenSize.x) || pixel.y >= int(u_ScreenSize.y)) {
+    ivec2 screenSize = ivec2(u_ScreenSize);
+    if (pixel.x >= screenSize.x || pixel.y >= screenSize.y) {
         return;
     }
 
@@ -59,45 +67,54 @@ void main() {
     vec3 viewNormal = normalize(mat3(u_ViewMatrix) * worldNormal);
     vec3 viewDir = normalize(-viewPos);
 
-    float noise = interleavedGradientNoise(vec2(pixel));
-    float phi = noise * PI;
-    vec2 sliceDir = vec2(cos(phi), sin(phi));
+    float ignAngle = interleavedGradientNoise(vec2(pixel));
+    float ignStep  = fract(ignAngle * 3.71828);
 
-    float worldRadius = 1.35;
-    float screenRadius = clamp((worldRadius * u_ProjMatrix[0][0]) / max(-viewPos.z, 0.5), 2.0, 24.0);
-    vec2 texelSize = 1.0 / u_ScreenSize;
+    float radiusPixels = clamp(24.0 / max(-viewPos.z, 0.5), 3.0, 36.0);
+    vec2  texelSize = 1.0 / u_ScreenSize;
 
-    float horizonCosPos = -1.0;
-    float horizonCosNeg = -1.0;
+    float visibility = 0.0;
 
-    for (int step = 1; step <= 4; ++step) {
-        float stepScale = (float(step) - 0.5 + fract(noise * 4.37)) / 4.0;
-        vec2 offset = sliceDir * texelSize * (screenRadius * stepScale);
+    for (int slice = 0; slice < GTAO_SLICES; ++slice) {
+        float phi = (PI / float(GTAO_SLICES)) * (float(slice) + ignAngle);
+        vec2 omega = vec2(cos(phi), sin(phi));
 
-        // Positive direction
-        vec2 uvPos = clamp(uv + offset, vec2(0.001), vec2(0.999));
-        float dPos = texture(u_Depth, uvPos).r;
-        vec3 sPos = reconstructViewPos(uvPos, dPos) - viewPos;
-        float lenPos = length(sPos);
-        if (lenPos > 0.001) {
-            float weight = clamp(1.0 - lenPos / worldRadius, 0.0, 1.0);
-            horizonCosPos = max(horizonCosPos, mix(-1.0, dot(sPos / lenPos, viewDir), weight));
+        float maxHorizonPos = -1.0;
+        float maxHorizonNeg = -1.0;
+
+        for (int stepIdx = 1; stepIdx <= GTAO_STEPS; ++stepIdx) {
+            float s = (float(stepIdx) - 0.5 + ignStep * 0.5) / float(GTAO_STEPS);
+            vec2 offsetUv = omega * (s * radiusPixels) * texelSize;
+
+            // Positive direction
+            vec2 uvPos = clamp(uv + offsetUv, vec2(0.001), vec2(0.999));
+            float dPos = texture(u_Depth, uvPos).r;
+            vec3 samplePos = reconstructViewPos(uvPos, dPos) - viewPos;
+            float distPos = length(samplePos);
+            if (distPos > 1e-4) {
+                float falloff = clamp(1.0 - (distPos / 2.5), 0.0, 1.0);
+                float h = dot(samplePos / distPos, viewDir);
+                maxHorizonPos = max(maxHorizonPos, mix(-1.0, h, falloff));
+            }
+
+            // Negative direction
+            vec2 uvNeg = clamp(uv - offsetUv, vec2(0.001), vec2(0.999));
+            float dNeg = texture(u_Depth, uvNeg).r;
+            vec3 sampleNeg = reconstructViewPos(uvNeg, dNeg) - viewPos;
+            float distNeg = length(sampleNeg);
+            if (distNeg > 1e-4) {
+                float falloff = clamp(1.0 - (distNeg / 2.5), 0.0, 1.0);
+                float h = dot(sampleNeg / distNeg, viewDir);
+                maxHorizonNeg = max(maxHorizonNeg, mix(-1.0, h, falloff));
+            }
         }
 
-        // Negative direction
-        vec2 uvNeg = clamp(uv - offset, vec2(0.001), vec2(0.999));
-        float dNeg = texture(u_Depth, uvNeg).r;
-        vec3 sNeg = reconstructViewPos(uvNeg, dNeg) - viewPos;
-        float lenNeg = length(sNeg);
-        if (lenNeg > 0.001) {
-            float weight = clamp(1.0 - lenNeg / worldRadius, 0.0, 1.0);
-            horizonCosNeg = max(horizonCosNeg, mix(-1.0, dot(sNeg / lenNeg, viewDir), weight));
-        }
+        float hPos = acos(clamp(maxHorizonPos, -1.0, 1.0));
+        float hNeg = acos(clamp(maxHorizonNeg, -1.0, 1.0));
+        float sliceVis = 0.5 * ((cos(hPos) + cos(hNeg)) + 1.0);
+        visibility += clamp(sliceVis, 0.0, 1.0);
     }
 
-    float hPos = acos(clamp(horizonCosPos, -1.0, 1.0));
-    float hNeg = acos(clamp(horizonCosNeg, -1.0, 1.0));
-    float visibility = clamp((sin(hPos) + sin(hNeg) + (hPos + hNeg) * cos(viewNormal.z)) * 0.25, 0.15, 1.0);
-
-    imageStore(u_AoOutput, pixel, vec4(visibility));
+    float ao = clamp(visibility / float(GTAO_SLICES), 0.05, 1.0);
+    imageStore(u_AoOutput, pixel, vec4(ao));
 }
