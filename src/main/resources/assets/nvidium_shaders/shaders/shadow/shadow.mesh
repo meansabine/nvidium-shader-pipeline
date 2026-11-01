@@ -1,0 +1,25 @@
+#version 460 core
+
+#extension GL_NV_mesh_shader : require
+#extension GL_NV_gpu_shader5 : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 16) in;
+layout(triangles, max_vertices = 64, max_primitives = 32) out;
+
+// Scene uniforms including cascade matrices
+#include <nvidium_shaders:common/scene_uniforms.glsl>
+
+uniform int u_CascadeIndex;
+
+taskNV in Task {
+    uint baseOffset;
+    uint quadCount;
+};
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) {
+        gl_PrimitiveCountNV = 0;
+    }
+    // High-speed depth-only mesh pass transforms vertices by u_CascadeViewProj[u_CascadeIndex]
+}

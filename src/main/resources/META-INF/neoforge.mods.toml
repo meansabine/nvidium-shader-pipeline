@@ -1,0 +1,34 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "LGPL-3.0-only"
+
+[[mods]]
+modId = "${mod_id}"
+version = "${version}"
+displayName = "Nvidium Shader Pipeline"
+authors = "Nvidium Community"
+description = '''
+Dedicated high-performance shader pipeline harness for Nvidium using modern Turing+ GPU capabilities.
+'''
+displayTest = "IGNORE_SERVER_VERSION"
+
+[[dependencies.nvidium_shaders]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1.0,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.nvidium_shaders]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.nvidium_shaders]]
+modId = "sodium"
+type = "required"
+versionRange = "[0.6.0,)"
+ordering = "AFTER"
+side = "CLIENT"

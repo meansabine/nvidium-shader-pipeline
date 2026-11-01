@@ -1,0 +1,67 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'net.neoforged.moddev' version '1.0.17'
+}
+
+tasks.named('wrapper', Wrapper) {
+    distributionType = Wrapper.DistributionType.BIN
+}
+
+version = project.mod_version
+group = project.mod_group_id
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+    maven {
+        name = "Modrinth"
+        url = "https://api.modrinth.com/maven"
+    }
+}
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+}
+
+neoForge {
+    version = project.neoforge_version
+
+    runs {
+        client {
+            client()
+            jvmArguments.addAll("-Xmx8G", "-XX:+UseZGC")
+        }
+        server {
+            server()
+        }
+    }
+
+    mods {
+        "${project.mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+processResources {
+    def buildProps = [
+            "version": project.version,
+            "minecraft_version": project.minecraft_version,
+            "mod_id": project.mod_id
+    ]
+
+    filesMatching("META-INF/neoforge.mods.toml") {
+        expand buildProps
+    }
+    inputs.properties(buildProps)
+}
+
+dependencies {
+    // Sodium
+    implementation "maven.modrinth:sodium:mc1.21.1-0.6.13-neoforge"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
