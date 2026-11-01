@@ -1,33 +1,29 @@
 #version 460 core
 
-// Global Scene Uniform Buffer (std140, binding = 3)
 layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;          // Camera view transform
-    mat4  u_ProjMatrix;          // Camera projection transform
-    mat4  u_ViewProjMatrix;      // Combined View * Projection
-    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (for depth unprojection)
-    mat4  u_CascadeViewProj[3];  // Orthographic View-Projection for 3 shadow cascades
-    vec4  u_CascadeSplits;       // x=Cascade 0 (16m), y=Cascade 1 (64m), z=Cascade 2 (256m), w=Unused
-    vec4  u_SunDirection;        // Normalized vector pointing towards the sun
-    vec4  u_SunColor;            // Sun intensity & spectral color (RGB), intensity multiplier (A)
-    vec4  u_AmbientColor;        // Sky ambient color (RGB)
-    vec4  u_CameraPos;           // World-space camera coordinates (XYZ)
-    vec2  u_ScreenSize;          // Display width, height in pixels
-    vec2  _pad0;                 // std140 alignment padding
-    float u_Time;                // Elapsed game time in seconds
-    int   u_FrameIndex;          // Monotonically increasing frame counter
-    float u_FogStart;            // Vanilla fog start distance in meters
-    float u_FogEnd;              // Vanilla fog end distance in meters
-    vec4  u_FogColor;            // Vanilla fog RGBA color
+    mat4  u_ViewMatrix;
+    mat4  u_ProjMatrix;
+    mat4  u_ViewProjMatrix;
+    mat4  u_InvViewProjMatrix;
+    mat4  u_CascadeViewProj[3];
+    vec4  u_CascadeSplits;
+    vec4  u_SunDirection;
+    vec4  u_SunColor;
+    vec4  u_AmbientColor;
+    vec4  u_CameraPos;
+    vec2  u_ScreenSize;
+    vec2  _pad0;
+    float u_Time;
+    int   u_FrameIndex;
+    float u_FogStart;
+    float u_FogEnd;
+    vec4  u_FogColor;
 };
 
+layout(binding = 0) uniform sampler2D u_OpaqueSceneColor;
+layout(binding = 1) uniform sampler2D u_SceneDepth;
+layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
 
-// Samplers for Pass 5 Water & Translucent Pass
-layout(binding = 0) uniform sampler2D u_OpaqueSceneColor; // Lit opaque scene from Pass 3
-layout(binding = 1) uniform sampler2D u_SceneDepth;       // Opaque scene depth
-layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap; // Optional shadow lookup for sun specularity
-
-// Inputs from Nvidium Water Mesh / Vertex Stage
 layout(location = 0) in vec3 v_WorldPos;
 layout(location = 1) in vec2 v_TexCoord;
 layout(location = 2) in vec2 v_LightCoord;
@@ -36,150 +32,58 @@ layout(location = 0) out vec4 outHdrColor;
 
 const float PI = 3.14159265359;
 
-// Recipe A: World Position Reconstruction from Depth
 vec3 reconstructWorldPos(vec2 uv, float depth) {
     vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vec4 worldPosH = u_InvViewProjMatrix * clip;
     return worldPosH.xyz / worldPosH.w;
 }
 
-// Recipe B: Analytical Surface Normal
-vec3 deriveGeometricNormal(vec3 worldPos) {
-    return normalize(cross(dFdx(worldPos), dFdy(worldPos)));
+float interleavedGradientNoise(vec2 pixelCoord) {
+    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+    float frameOffset = float(u_FrameIndex % 64) * 5.588238;
+    return fract(magic.z * fract(dot(pixelCoord + frameOffset, magic.xy)));
 }
 
-// 1. Animated Multi-Octave Gerstner Micro-Wave Normal Perturbations using u_Time
-vec3 evaluateGerstnerWaterNormal(vec3 worldPos, float time) {
-    vec2 p = worldPos.xz;
-    vec3 tangent = vec3(1.0, 0.0, 0.0);
-    vec3 binormal = vec3(0.0, 0.0, 1.0);
+float hash21(vec2 p) {
+    p = fract(p * vec2(234.34, 435.345));
+    p += dot(p, p + 34.23);
+    return fract(p.x * p.y);
+}
 
-    // 6-octave directional Gerstner wave bank: xy = direction, z = steepness, w = wavelength
-    const vec4 waves[6] = vec4[](
-        vec4( 0.85,  0.52, 0.12, 3.80),
-        vec4( 0.35, -0.93, 0.10, 2.25),
-        vec4(-0.62,  0.78, 0.08, 1.40),
-        vec4(-0.91, -0.41, 0.06, 0.85),
-        vec4( 0.48,  0.87, 0.05, 0.42),
-        vec4(-0.25, -0.96, 0.04, 0.22)
-    );
+float valueNoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
 
-    for (int i = 0; i < 6; ++i) {
-        vec2 dir = normalize(waves[i].xy);
-        float steepness = waves[i].z;
-        float wavelength = waves[i].w;
-        float k = 2.0 * PI / wavelength;
-        float c = sqrt(9.81 / k);
-        float f = k * (dot(dir, p) - c * time * 1.15);
-        float a = steepness / k;
-
-        float sinF = sin(f);
-        float cosF = cos(f);
-
-        tangent += vec3(
-            -dir.x * dir.x * steepness * sinF,
-             dir.x * steepness * cosF,
-            -dir.x * dir.y * steepness * sinF
-        );
-        binormal += vec3(
-            -dir.x * dir.y * steepness * sinF,
-             dir.y * steepness * cosF,
-            -dir.y * dir.y * steepness * sinF
-        );
+float fbm(vec2 p) {
+    float v = 0.0;
+    float amp = 0.5;
+    mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+    for (int i = 0; i < 4; ++i) {
+        v += amp * valueNoise(p);
+        p = rot * p * 2.03;
+        amp *= 0.5;
     }
-
-    return normalize(cross(binormal, tangent));
+    return v;
 }
 
-// Cascaded Shadow Map check for specular sun glitter
-float sampleWaterSunShadow(vec3 worldPos, float viewDist) {
-    int cascade = (viewDist < u_CascadeSplits.x) ? 0 :
-                  (viewDist < u_CascadeSplits.y) ? 1 : 2;
-    vec4 shadowClip = u_CascadeViewProj[cascade] * vec4(worldPos, 1.0);
-    vec3 shadowCoord = shadowClip.xyz / shadowClip.w * 0.5 + 0.5;
-    if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
-        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
-        shadowCoord.z > 1.0) {
-        return 1.0;
-    }
-    return texture(u_ShadowMap, vec4(shadowCoord.xy, float(cascade), shadowCoord.z - 0.0015));
-}
-
-// 2. Screen-Space Reflections (SSR) raymarching the opaque depth buffer
-vec4 traceScreenSpaceReflection(vec3 worldPos, vec3 R, float viewDist) {
-    const int   SSR_STEPS = 28;
-    const int   BINARY_STEPS = 5;
-    float maxRayDist = clamp(viewDist * 1.25, 16.0, 96.0);
-    float stepSize = maxRayDist / float(SSR_STEPS);
-
-    vec3 rayPos = worldPos + R * 0.08;
-    vec3 prevPos = rayPos;
-
-    for (int i = 0; i < SSR_STEPS; ++i) {
-        prevPos = rayPos;
-        rayPos += R * stepSize;
-        stepSize *= 1.06; // Mild exponential step growth
-
-        vec4 clip = u_ViewProjMatrix * vec4(rayPos, 1.0);
-        vec3 ndc = clip.xyz / clip.w;
-        vec2 uv = ndc.xy * 0.5 + 0.5;
-        float rayDepth = ndc.z * 0.5 + 0.5;
-
-        // Abort if outside screen frustum
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || rayDepth >= 1.0 || rayDepth <= 0.0) {
-            break;
-        }
-
-        float sceneDepth = texture(u_SceneDepth, uv).r;
-        if (rayDepth > sceneDepth && sceneDepth < 0.99999) {
-            // Binary search refinement
-            vec3 minPos = prevPos;
-            vec3 maxPos = rayPos;
-            vec2 hitUv = uv;
-            float hitSceneDepth = sceneDepth;
-            float hitRayDepth = rayDepth;
-
-            for (int b = 0; b < BINARY_STEPS; ++b) {
-                vec3 midPos = 0.5 * (minPos + maxPos);
-                vec4 mClip = u_ViewProjMatrix * vec4(midPos, 1.0);
-                vec3 mNdc = mClip.xyz / mClip.w;
-                hitUv = mNdc.xy * 0.5 + 0.5;
-                hitRayDepth = mNdc.z * 0.5 + 0.5;
-                hitSceneDepth = texture(u_SceneDepth, hitUv).r;
-
-                if (hitRayDepth > hitSceneDepth) {
-                    maxPos = midPos;
-                } else {
-                    minPos = midPos;
-                }
-            }
-
-            vec3 hitWorldPos = reconstructWorldPos(hitUv, hitSceneDepth);
-            float thickness = length(hitWorldPos - maxPos);
-            if (thickness < 2.5) {
-                // Smooth screen-edge vignette fade
-                vec2 edgeDist = smoothstep(vec2(0.0), vec2(0.12), hitUv) *
-                                (1.0 - smoothstep(vec2(0.88), vec2(1.0), hitUv));
-                float confidence = edgeDist.x * edgeDist.y * (1.0 - float(i) / float(SSR_STEPS));
-                vec3 reflColor = texture(u_OpaqueSceneColor, hitUv).rgb;
-                return vec4(reflColor, clamp(confidence, 0.0, 1.0));
-            }
-        }
-    }
-    return vec4(0.0);
-}
-
-// Recipe E GGX helpers for solar specular glitter on water
 float distributionGGX(vec3 N, vec3 H, float roughness) {
     float a = roughness * roughness;
     float a2 = a * a;
     float NdotH = max(dot(N, H), 0.0);
-    float denom = (NdotH * NdotH * (a2 - 1.0) + 1.0);
-    return a2 / (PI * denom * denom);
+    float NdotH2 = NdotH * NdotH;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    return a2 / (PI * denom * denom + 0.00001);
 }
 
 float geometrySchlickGGX(float NdotV, float roughness) {
-    float r = roughness + 1.0;
+    float r = (roughness + 1.0);
     float k = (r * r) / 8.0;
     return NdotV / (NdotV * (1.0 - k) + k);
 }
@@ -188,83 +92,181 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-void main() {
-    vec2 screenUv = gl_FragCoord.xy / u_ScreenSize;
-    vec3 V = normalize(u_CameraPos.xyz - v_WorldPos);
-    float viewDist = length(u_CameraPos.xyz - v_WorldPos);
+vec3 calculateGerstnerNormal(vec2 pos, float time) {
+    const vec2 dirs[6] = vec2[6](
+        normalize(vec2(1.0, 0.35)),
+        normalize(vec2(0.65, -0.75)),
+        normalize(vec2(-0.45, 0.88)),
+        normalize(vec2(-0.82, -0.55)),
+        normalize(vec2(0.25, -0.96)),
+        normalize(vec2(-0.92, 0.38))
+    );
+    const float freqs[6]  = float[6](0.55, 1.15, 2.35, 4.20, 7.80, 14.50);
+    const float amps[6]   = float[6](0.12, 0.065, 0.032, 0.016, 0.0075, 0.0035);
+    const float speeds[6] = float[6](1.25, 1.70, 2.30, 3.10, 4.20, 5.60);
+    const float steep[6]  = float[6](0.45, 0.40, 0.35, 0.30, 0.25, 0.20);
 
-    // Construct perturbed surface normal from Gerstner wave bank
-    vec3 geomNormal = deriveGeometricNormal(v_WorldPos);
-    vec3 waveNormal = evaluateGerstnerWaterNormal(v_WorldPos, u_Time);
-    // Align wave normal with geometric orientation (handles flowing water slopes)
-    vec3 N = normalize(mix(geomNormal, waveNormal, 0.85));
+    vec3 tangent = vec3(1.0, 0.0, 0.0);
+    vec3 binormal = vec3(0.0, 0.0, 1.0);
 
-    // 3. Depth-Based Water Refraction with Beer-Lambert Physical Color Absorption
-    float rawSceneDepth = texture(u_SceneDepth, screenUv).r;
-    vec3 unrefractedFloorPos = reconstructWorldPos(screenUv, rawSceneDepth);
-    float rawWaterDepth = max(0.0, length(unrefractedFloorPos - u_CameraPos.xyz) - viewDist);
+    for (int i = 0; i < 6; ++i) {
+        float w = freqs[i];
+        float A = amps[i];
+        float Q = steep[i] / (w * A * 6.0);
+        float phase = dot(dirs[i], pos) * w + time * speeds[i];
+        float s = sin(phase);
+        float c = cos(phase);
+        float wa = w * A;
 
-    // Chromatic / wave normal UV refraction offset scaled by water depth
-    float refractStrength = clamp(rawWaterDepth * 0.035, 0.0, 0.045) / max(viewDist * 0.15, 1.0);
-    vec2 refractUv = clamp(screenUv + N.xz * refractStrength, vec2(0.001), vec2(0.999));
+        tangent.x  -= Q * dirs[i].x * dirs[i].x * wa * s;
+        tangent.y  += dirs[i].x * wa * c;
+        tangent.z  -= Q * dirs[i].x * dirs[i].y * wa * s;
 
-    float refractedDepthSample = texture(u_SceneDepth, refractUv).r;
-    // Prevent refracting foreground objects that sit in front of the water surface
-    if (refractedDepthSample < gl_FragCoord.z) {
-        refractUv = screenUv;
-        refractedDepthSample = rawSceneDepth;
+        binormal.x -= Q * dirs[i].x * dirs[i].y * wa * s;
+        binormal.y += dirs[i].y * wa * c;
+        binormal.z -= Q * dirs[i].y * dirs[i].y * wa * s;
     }
 
-    vec3 seabedWorldPos = reconstructWorldPos(refractUv, refractedDepthSample);
-    float opticalWaterDepth = max(0.0, length(seabedWorldPos - u_CameraPos.xyz) - viewDist);
-    float verticalDepth = max(0.0, v_WorldPos.y - seabedWorldPos.y);
-    float effectiveDepth = mix(opticalWaterDepth, verticalDepth, 0.4);
+    float micro1 = fbm(pos * 3.5 + vec2(time * 0.4, -time * 0.3));
+    float micro2 = fbm(pos * 7.2 - vec2(time * 0.5, time * 0.35));
+    vec3 N = normalize(cross(binormal, tangent));
+    N.xz += (vec2(micro1, micro2) - 0.5) * 0.06;
+    return normalize(N);
+}
 
-    vec3 seabedColor = texture(u_OpaqueSceneColor, refractUv).rgb;
+float sampleWaterShadow(vec3 worldPos, float viewDist) {
+    int cascadeIdx = 2;
+    if (viewDist < u_CascadeSplits.x) cascadeIdx = 0;
+    else if (viewDist < u_CascadeSplits.y) cascadeIdx = 1;
 
-    // Physical Beer-Lambert absorption coefficients (R absorbed rapidly, G/B penetrate deeper)
-    const vec3 sigmaAbsorption = vec3(0.42, 0.11, 0.045);
-    vec3 transmittance = exp(-sigmaAbsorption * effectiveDepth);
+    vec4 shadowClip = u_CascadeViewProj[cascadeIdx] * vec4(worldPos, 1.0);
+    vec3 shadowNdc = shadowClip.xyz / shadowClip.w;
+    vec3 shadowUv = shadowNdc * 0.5 + 0.5;
 
-    // Deep water multiple-scattering in-scatter color (dark turquoise / navy)
-    vec3 sunRadiance = u_SunColor.rgb * u_SunColor.a;
-    vec3 L_sun = normalize(u_SunDirection.xyz);
-    float sunElevation = max(L_sun.y, 0.05);
-    vec3 deepWaterInScatter = vec3(0.008, 0.052, 0.095) * (u_AmbientColor.rgb + sunRadiance * sunElevation * 0.25);
+    if (shadowUv.x < 0.0 || shadowUv.x > 1.0 || shadowUv.y < 0.0 || shadowUv.y > 1.0 || shadowUv.z > 1.0) {
+        return 1.0;
+    }
 
-    // Subtle shoreline foam at shallow contact boundaries
-    float foamMask = smoothstep(0.35, 0.0, verticalDepth) * max(0.0, sin(effectiveDepth * 24.0 - u_Time * 4.0) * 0.5 + 0.5);
-    vec3 refractedWater = seabedColor * transmittance + deepWaterInScatter * (1.0 - transmittance);
+    float bias = 0.0008 * float(cascadeIdx + 1);
+    return texture(u_ShadowMap, vec4(shadowUv.xy, float(cascadeIdx), shadowUv.z - bias));
+}
 
-    // 4. Screen-Space Reflections (SSR) + Procedural Sky Fallback
-    vec3 R = reflect(-V, N);
-    vec4 ssrSample = traceScreenSpaceReflection(v_WorldPos, R, viewDist);
+vec3 evaluateSkyGradient(vec3 dir, vec3 sunDir) {
+    float horizon = clamp(dir.y, 0.0, 1.0);
+    vec3 zenithCol = max(u_AmbientColor.rgb * 1.15, vec3(0.12, 0.28, 0.62));
+    vec3 horizonCol = mix(u_FogColor.rgb, u_SunColor.rgb * 0.65, 0.25);
+    vec3 sky = mix(horizonCol, zenithCol, pow(horizon, 0.55));
+    float sunDot = max(dot(dir, sunDir), 0.0);
+    sky += u_SunColor.rgb * pow(sunDot, 16.0) * 0.35;
+    return sky;
+}
 
-    // Procedural sky reflection fallback
-    float skyZenith = clamp(R.y, 0.0, 1.0);
-    vec3 skyFallback = mix(u_FogColor.rgb, u_AmbientColor.rgb * 1.15, pow(skyZenith, 0.55));
-    vec3 reflectedColor = mix(skyFallback, ssrSample.rgb, ssrSample.a);
+void main() {
+    vec2 screenUv = gl_FragCoord.xy / u_ScreenSize;
+    vec3 viewVec = v_WorldPos - u_CameraPos.xyz;
+    float surfaceDist = length(viewVec);
+    vec3 V = -normalize(viewVec);
+    vec3 L = normalize(u_SunDirection.xyz);
 
-    // Direct GGX Sun Specular Glitter on water ripples
-    vec3 H = normalize(V + L_sun);
-    float waterRoughness = 0.045;
-    float NDF = distributionGGX(N, H, waterRoughness);
-    float G   = geometrySchlickGGX(max(dot(N, V), 0.0), waterRoughness) *
-                geometrySchlickGGX(max(dot(N, L_sun), 0.0), waterRoughness);
-    vec3 F_sun = fresnelSchlick(max(dot(H, V), 0.0), vec3(0.02));
-    float NdotL = max(dot(N, L_sun), 0.0);
+    vec3 N = calculateGerstnerNormal(v_WorldPos.xz, u_Time);
     float NdotV = max(dot(N, V), 0.001);
-    float sunShadow = sampleWaterSunShadow(v_WorldPos, viewDist);
-    vec3 sunSpecHighlight = (NDF * G * F_sun) / (4.0 * NdotV * NdotL + 0.0001) * sunRadiance * NdotL * sunShadow;
 
-    // 5. Schlick Fresnel Blending (Water IOR = 1.333 -> F0 = 0.02)
-    vec3 F = fresnelSchlick(max(dot(N, V), 0.0), vec3(0.02));
-    vec3 waterSurfaceColor = mix(refractedWater, reflectedColor, F) + sunSpecHighlight;
-    waterSurfaceColor = mix(waterSurfaceColor, u_AmbientColor.rgb * 0.9, foamMask * 0.35);
+    float rawFloorDepth = texture(u_SceneDepth, screenUv).r;
+    vec3 floorWorldPos = reconstructWorldPos(screenUv, rawFloorDepth);
+    float floorDist = length(floorWorldPos - u_CameraPos.xyz);
+    float deltaDepth = max(floorDist - surfaceDist, 0.0);
+    float verticalDepth = max(v_WorldPos.y - floorWorldPos.y, 0.0);
 
-    // Apply distance fog matching Pass 3
-    float fogFactor = smoothstep(u_FogStart, u_FogEnd, viewDist);
-    vec3 finalColor = mix(waterSurfaceColor, u_FogColor.rgb, fogFactor);
+    float distortScale = clamp(deltaDepth * 0.35, 0.0, 1.0) * 0.035 / max(surfaceDist * 0.15, 1.0);
+    vec2 distortOffset = N.xz * distortScale;
+    vec2 refractedUv = clamp(screenUv + distortOffset, vec2(0.001), vec2(0.999));
+
+    float refractedRawDepth = texture(u_SceneDepth, refractedUv).r;
+    vec3 refractedFloorPos = reconstructWorldPos(refractedUv, refractedRawDepth);
+    float refractedFloorDist = length(refractedFloorPos - u_CameraPos.xyz);
+
+    if (refractedFloorDist < surfaceDist) {
+        refractedUv = screenUv;
+        refractedFloorDist = floorDist;
+        refractedFloorPos = floorWorldPos;
+    }
+
+    deltaDepth = max(refractedFloorDist - surfaceDist, 0.0);
+    verticalDepth = max(v_WorldPos.y - refractedFloorPos.y, 0.0);
+
+    vec3 seabedColor = texture(u_OpaqueSceneColor, refractedUv).rgb;
+
+    const vec3 sigmaExtinction = vec3(0.46, 0.14, 0.055);
+    vec3 transmittance = exp(-sigmaExtinction * deltaDepth);
+
+    float skyLightFactor = clamp(v_LightCoord.y, 0.05, 1.0);
+    vec3 shallowInScatter = vec3(0.02, 0.22, 0.26) * (u_AmbientColor.rgb + u_SunColor.rgb * max(L.y, 0.0) * 0.35);
+    vec3 deepInScatter    = vec3(0.005, 0.045, 0.10) * (u_AmbientColor.rgb + 0.05);
+    vec3 waterVolumeColor = mix(shallowInScatter, deepInScatter, clamp(verticalDepth / 18.0, 0.0, 1.0)) * skyLightFactor;
+
+    vec3 refractedColor = seabedColor * transmittance + waterVolumeColor * (1.0 - transmittance);
+
+    vec3 R = reflect(-V, N);
+    vec3 reflectionColor = evaluateSkyGradient(R, L) * skyLightFactor;
+
+    const int ssrSteps = 20;
+    float jitter = interleavedGradientNoise(gl_FragCoord.xy);
+    vec3 marchStart = v_WorldPos + N * 0.08;
+    float stepSize = 0.65;
+    vec3 rayPos = marchStart + R * (stepSize * jitter);
+
+    for (int i = 0; i < ssrSteps; ++i) {
+        vec4 proj = u_ViewProjMatrix * vec4(rayPos, 1.0);
+        vec3 ndc = proj.xyz / proj.w;
+        vec2 rayUv = ndc.xy * 0.5 + 0.5;
+
+        if (rayUv.x < 0.0 || rayUv.x > 1.0 || rayUv.y < 0.0 || rayUv.y > 1.0 || ndc.z >= 1.0) {
+            break;
+        }
+
+        float sceneZ = texture(u_SceneDepth, rayUv).r;
+        float rayZ = ndc.z * 0.5 + 0.5;
+        float thickness = rayZ - sceneZ;
+
+        if (thickness > 0.00005 && thickness < 0.008) {
+            vec2 edgeFade = smoothstep(vec2(0.0), vec2(0.1), rayUv) * (1.0 - smoothstep(vec2(0.9), vec2(1.0), rayUv));
+            float ssrWeight = clamp(edgeFade.x * edgeFade.y, 0.0, 1.0);
+            vec3 hitCol = texture(u_OpaqueSceneColor, rayUv).rgb;
+            reflectionColor = mix(reflectionColor, hitCol, ssrWeight);
+            break;
+        }
+
+        stepSize *= 1.18;
+        rayPos += R * stepSize;
+    }
+
+    const vec3 F0 = vec3(0.02);
+    vec3 F = fresnelSchlick(NdotV, F0);
+
+    vec3 H = normalize(V + L);
+    float roughness = 0.045;
+    float D = distributionGGX(N, H, roughness);
+    float G = geometrySchlickGGX(NdotV, roughness) * geometrySchlickGGX(max(dot(N, L), 0.001), roughness);
+    vec3 F_sun = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    float NdotL = max(dot(N, L), 0.0);
+
+    float sunShadow = sampleWaterShadow(v_WorldPos, surfaceDist);
+    vec3 sunGlitter = (D * G * F_sun) / max(4.0 * NdotV * max(NdotL, 0.001), 0.001)
+                      * u_SunColor.rgb * u_SunColor.a * NdotL * sunShadow * 2.5;
+
+    vec3 waterSurfaceColor = mix(refractedColor, reflectionColor, F) + sunGlitter;
+
+    float foamNoise = fbm(v_WorldPos.xz * 2.8 + vec2(u_Time * 0.35, -u_Time * 0.25));
+    float shoreMask = 1.0 - smoothstep(0.0, 0.65, deltaDepth);
+    float crestMask = smoothstep(0.22, 0.45, 1.0 - N.y);
+    float foamFactor = clamp(shoreMask * smoothstep(0.32, 0.75, foamNoise + shoreMask * 0.4) + crestMask * foamNoise * 0.35, 0.0, 1.0);
+    vec3 foamAlbedo = vec3(0.92, 0.96, 1.0) * (u_AmbientColor.rgb + u_SunColor.rgb * max(L.y, 0.0) * sunShadow * 0.85) * skyLightFactor;
+
+    vec3 finalColor = mix(waterSurfaceColor, foamAlbedo, foamFactor * 0.85);
+
+    float fogFactor = clamp((surfaceDist - u_FogStart) / max(u_FogEnd - u_FogStart, 1.0), 0.0, 1.0);
+    fogFactor = fogFactor * fogFactor * (3.0 - 2.0 * fogFactor);
+    finalColor = mix(finalColor, u_FogColor.rgb, fogFactor);
 
     outHdrColor = vec4(max(finalColor, vec3(0.0)), 1.0);
 }

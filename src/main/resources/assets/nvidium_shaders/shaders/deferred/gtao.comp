@@ -1,217 +1,103 @@
 #version 460 core
 
-// Global Scene Uniform Buffer (std140, binding = 3)
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
 layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;          // Camera view transform
-    mat4  u_ProjMatrix;          // Camera projection transform
-    mat4  u_ViewProjMatrix;      // Combined View * Projection
-    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (for depth unprojection)
-    mat4  u_CascadeViewProj[3];  // Orthographic View-Projection for 3 shadow cascades
-    vec4  u_CascadeSplits;       // x=Cascade 0 (16m), y=Cascade 1 (64m), z=Cascade 2 (256m), w=Unused
-    vec4  u_SunDirection;        // Normalized vector pointing towards the sun
-    vec4  u_SunColor;            // Sun intensity & spectral color (RGB), intensity multiplier (A)
-    vec4  u_AmbientColor;        // Sky ambient color (RGB)
-    vec4  u_CameraPos;           // World-space camera coordinates (XYZ)
-    vec2  u_ScreenSize;          // Display width, height in pixels
-    vec2  _pad0;                 // std140 alignment padding
-    float u_Time;                // Elapsed game time in seconds
-    int   u_FrameIndex;          // Monotonically increasing frame counter
-    float u_FogStart;            // Vanilla fog start distance in meters
-    float u_FogEnd;              // Vanilla fog end distance in meters
-    vec4  u_FogColor;            // Vanilla fog RGBA color
+    mat4  u_ViewMatrix;
+    mat4  u_ProjMatrix;
+    mat4  u_ViewProjMatrix;
+    mat4  u_InvViewProjMatrix;
+    mat4  u_CascadeViewProj[3];
+    vec4  u_CascadeSplits;
+    vec4  u_SunDirection;
+    vec4  u_SunColor;
+    vec4  u_AmbientColor;
+    vec4  u_CameraPos;
+    vec2  u_ScreenSize;
+    vec2  _pad0;
+    float u_Time;
+    int   u_FrameIndex;
+    float u_FogStart;
+    float u_FogEnd;
+    vec4  u_FogColor;
 };
 
-
-layout(local_size_x = 16, local_size_y = 16) in;
-
-// G-Buffer Bindings from instructions.md
-layout(binding = 1) uniform sampler2D u_NormalMetallic; // From G-Buffer RT1 (RGB: Normal, A: Metallic)
-layout(binding = 3) uniform sampler2D u_Depth;          // Hardware Scene Depth (GL_DEPTH_COMPONENT32F)
-
-// Output R8 / R16F Ambient Occlusion & Bent Normal visibility texture
-layout(binding = 0, r16f) uniform writeonly restrict image2D u_OutGTAO;
+layout(binding = 1) uniform sampler2D u_NormalMetallic;
+layout(binding = 3) uniform sampler2D u_Depth;
+layout(r16f, binding = 0) uniform writeonly image2D u_AoOutput;
 
 const float PI = 3.14159265359;
-const float HALF_PI = 1.57079632679;
-const int   NUM_DIRECTIONS = 4;     // Multi-directional horizon sweeps per pixel
-const int   NUM_STEPS_PER_DIR = 6;  // Horizon search steps per direction
-const float WORLD_RADIUS = 1.65;    // World-space occlusion radius in meters
-
-// Shared workgroup tile memory for depth- & normal-aware bilateral blur (16x16 threads)
-shared float s_RawAO[16][16];
-shared float s_LinearDepth[16][16];
-shared vec3  s_ViewNormal[16][16];
-
-// Recipe A: World Position Reconstruction from Depth
-vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
-    vec4 worldPosH = u_InvViewProjMatrix * clip;
-    return worldPosH.xyz / worldPosH.w;
-}
 
 vec3 reconstructViewPos(vec2 uv, float depth) {
-    vec3 worldPos = reconstructWorldPos(uv, depth);
+    vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    vec4 worldPosH = u_InvViewProjMatrix * clip;
+    vec3 worldPos = worldPosH.xyz / worldPosH.w;
     return (u_ViewMatrix * vec4(worldPos, 1.0)).xyz;
 }
 
-// Spatio-temporal Interleaved Gradient Noise (Jimenez et al. GTAO)
-vec2 spatialTemporalNoise(uvec2 pixel) {
-    float phi = fract(52.9829189 * fract(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
-    float frameRot = float(u_FrameIndex % 64) * 0.61803398875;
-    float jitter = fract(phi + frameRot);
-    return vec2(fract(phi + float(u_FrameIndex % 16) * 0.25), jitter);
-}
-
-// Fast acos polynomial approximation
-float fastAcos(float x) {
-    float ax = abs(x);
-    float res = (-0.156583 * ax + HALF_PI) * sqrt(max(1.0 - ax, 0.0));
-    return (x >= 0.0) ? res : (PI - res);
+float interleavedGradientNoise(vec2 pixelCoord) {
+    vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
+    float frameOffset = float(u_FrameIndex % 64) * 5.588238;
+    return fract(magic.z * fract(dot(pixelCoord + frameOffset, magic.xy)));
 }
 
 void main() {
-    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
-    ivec2 localId    = ivec2(gl_LocalInvocationID.xy);
-    ivec2 screenSize = ivec2(u_ScreenSize);
-
-    vec2 uv = (vec2(pixelCoord) + 0.5) / u_ScreenSize;
-    float depth = texture(u_Depth, uv).r;
-
-    // Sky early initialization
-    if (depth >= 0.99999) {
-        s_RawAO[localId.y][localId.x]       = 1.0;
-        s_LinearDepth[localId.y][localId.x] = 1e6;
-        s_ViewNormal[localId.y][localId.x]  = vec3(0.0, 0.0, 1.0);
-    } else {
-        vec3 viewPos = reconstructViewPos(uv, depth);
-        vec3 worldNormal = normalize(texture(u_NormalMetallic, uv).rgb * 2.0 - 1.0);
-        vec3 viewNormal  = normalize(mat3(u_ViewMatrix) * worldNormal);
-        vec3 viewVec     = normalize(-viewPos);
-        float linearZ    = -viewPos.z;
-
-        // Project world radius to screen pixel radius
-        float projScale = u_ProjMatrix[1][1] * u_ScreenSize.y * 0.5;
-        float pixelRadius = clamp((WORLD_RADIUS * projScale) / max(linearZ, 0.1), 3.0, 96.0);
-
-        vec2 noise = spatialTemporalNoise(uvec2(pixelCoord));
-        float totalVisibility = 0.0;
-        vec2 texelSize = 1.0 / u_ScreenSize;
-
-        // Multi-directional horizon sweep loop (GTAO analytical integral)
-        for (int d = 0; d < NUM_DIRECTIONS; ++d) {
-            float phi = (float(d) + noise.x) * (PI / float(NUM_DIRECTIONS));
-            vec2 omega = vec2(cos(phi), sin(phi));
-
-            // Construct slice plane basis with view vector
-            vec3 sliceDir = vec3(omega.x, omega.y, 0.0);
-            vec3 orthoDir = sliceDir - dot(sliceDir, viewVec) * viewVec;
-            vec3 axisVec  = normalize(cross(sliceDir, viewVec));
-            vec3 projNormal = viewNormal - axisVec * dot(viewNormal, axisVec);
-            float projNormalLen = max(length(projNormal), 0.0001);
-
-            float cosN = clamp(dot(projNormal / projNormalLen, viewVec), -1.0, 1.0);
-            float signN = (dot(orthoDir, projNormal) >= 0.0) ? -1.0 : 1.0;
-            float nAngle = signN * fastAcos(cosN);
-
-            // Cosine of lowest possible horizon angles
-            float lowHorizonCosPos = cos(nAngle + HALF_PI);
-            float lowHorizonCosNeg = cos(nAngle - HALF_PI);
-            float hCosPos = lowHorizonCosPos;
-            float hCosNeg = lowHorizonCosNeg;
-
-            for (int s = 1; s <= NUM_STEPS_PER_DIR; ++s) {
-                float stepFraction = (float(s) - 1.0 + noise.y) / float(NUM_STEPS_PER_DIR);
-                stepFraction = stepFraction * stepFraction; // Quadratic sample distribution near origin
-                vec2 uvOffset = round(omega * max(pixelRadius * stepFraction, float(s))) * texelSize;
-
-                // Positive horizon sweep
-                vec2 uvPos = clamp(uv + uvOffset, vec2(0.001), vec2(0.999));
-                float depthPos = texture(u_Depth, uvPos).r;
-                if (depthPos < 0.99999) {
-                    vec3 sampleViewPos = reconstructViewPos(uvPos, depthPos);
-                    vec3 deltaPos = sampleViewPos - viewPos;
-                    float distPos = length(deltaPos);
-                    if (distPos > 0.0001) {
-                        float falloff = clamp((WORLD_RADIUS - distPos) / (WORLD_RADIUS * 0.45), 0.0, 1.0);
-                        float sampleCos = dot(deltaPos / distPos, viewVec);
-                        hCosPos = max(hCosPos, mix(lowHorizonCosPos, sampleCos, falloff));
-                    }
-                }
-
-                // Negative horizon sweep
-                vec2 uvNeg = clamp(uv - uvOffset, vec2(0.001), vec2(0.999));
-                float depthNeg = texture(u_Depth, uvNeg).r;
-                if (depthNeg < 0.99999) {
-                    vec3 sampleViewNeg = reconstructViewPos(uvNeg, depthNeg);
-                    vec3 deltaNeg = sampleViewNeg - viewPos;
-                    float distNeg = length(deltaNeg);
-                    if (distNeg > 0.0001) {
-                        float falloff = clamp((WORLD_RADIUS - distNeg) / (WORLD_RADIUS * 0.45), 0.0, 1.0);
-                        float sampleCos = dot(deltaNeg / distNeg, viewVec);
-                        hCosNeg = max(hCosNeg, mix(lowHorizonCosNeg, sampleCos, falloff));
-                    }
-                }
-            }
-
-            float h1 = -fastAcos(clamp(hCosNeg, -1.0, 1.0));
-            float h2 =  fastAcos(clamp(hCosPos, -1.0, 1.0));
-
-            // Analytical inner integral over the slice hemisphere
-            float iArc1 = (cosN + 2.0 * h1 * sin(nAngle) - cos(2.0 * h1 - nAngle)) * 0.25;
-            float iArc2 = (cosN + 2.0 * h2 * sin(nAngle) - cos(2.0 * h2 - nAngle)) * 0.25;
-            totalVisibility += projNormalLen * (iArc1 + iArc2);
-        }
-
-        float rawAO = clamp(totalVisibility / float(NUM_DIRECTIONS), 0.0, 1.0);
-        // Apply GTAO multi-bounce approximation (Jimenez et al.)
-        float multiBounceAO = rawAO / (rawAO + (1.0 - rawAO) * 0.55);
-
-        s_RawAO[localId.y][localId.x]       = clamp(multiBounceAO, 0.0, 1.0);
-        s_LinearDepth[localId.y][localId.x] = linearZ;
-        s_ViewNormal[localId.y][localId.x]  = viewNormal;
-    }
-
-    // Synchronize workgroup tile for depth-aware bilateral spatial filter
-    barrier();
-
-    if (pixelCoord.x >= screenSize.x || pixelCoord.y >= screenSize.y) {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(u_ScreenSize.x) || pixel.y >= int(u_ScreenSize.y)) {
         return;
     }
 
-    float centerDepth  = s_LinearDepth[localId.y][localId.x];
-    vec3  centerNormal = s_ViewNormal[localId.y][localId.x];
-    float centerAO     = s_RawAO[localId.y][localId.x];
-
-    if (centerDepth >= 1e5) {
-        imageStore(u_OutGTAO, pixelCoord, vec4(1.0));
+    vec2 uv = (vec2(pixel) + 0.5) / u_ScreenSize;
+    float centerDepth = texture(u_Depth, uv).r;
+    if (centerDepth >= 0.999999) {
+        imageStore(u_AoOutput, pixel, vec4(1.0));
         return;
     }
 
-    // 5x5 Depth- and Normal-Aware Bilateral Blur within shared tile memory
-    float blurredAO = 0.0;
-    float totalWeight = 0.0;
-    const float spatialKernel[5] = float[](0.15, 0.22, 0.26, 0.22, 0.15);
+    vec3 viewPos = reconstructViewPos(uv, centerDepth);
+    vec3 worldNormal = normalize(texture(u_NormalMetallic, uv).xyz * 2.0 - 1.0);
+    vec3 viewNormal = normalize(mat3(u_ViewMatrix) * worldNormal);
+    vec3 viewDir = normalize(-viewPos);
 
-    for (int dy = -2; dy <= 2; ++dy) {
-        int ny = clamp(localId.y + dy, 0, 15);
-        for (int dx = -2; dx <= 2; ++dx) {
-            int nx = clamp(localId.x + dx, 0, 15);
+    float noise = interleavedGradientNoise(vec2(pixel));
+    float phi = noise * PI;
+    vec2 sliceDir = vec2(cos(phi), sin(phi));
 
-            float sampleAO     = s_RawAO[ny][nx];
-            float sampleDepth  = s_LinearDepth[ny][nx];
-            vec3  sampleNormal = s_ViewNormal[ny][nx];
+    float worldRadius = 1.35;
+    float screenRadius = clamp((worldRadius * u_ProjMatrix[0][0]) / max(-viewPos.z, 0.5), 2.0, 24.0);
+    vec2 texelSize = 1.0 / u_ScreenSize;
 
-            float wSpatial = spatialKernel[dx + 2] * spatialKernel[dy + 2];
-            float depthDiff = abs(sampleDepth - centerDepth) / max(centerDepth * 0.05, 0.05);
-            float wDepth = exp(-depthDiff * depthDiff * 2.5);
-            float wNormal = pow(max(dot(centerNormal, sampleNormal), 0.0), 8.0);
+    float horizonCosPos = -1.0;
+    float horizonCosNeg = -1.0;
 
-            float weight = wSpatial * wDepth * wNormal;
-            blurredAO += sampleAO * weight;
-            totalWeight += weight;
+    for (int step = 1; step <= 4; ++step) {
+        float stepScale = (float(step) - 0.5 + fract(noise * 4.37)) / 4.0;
+        vec2 offset = sliceDir * texelSize * (screenRadius * stepScale);
+
+        // Positive direction
+        vec2 uvPos = clamp(uv + offset, vec2(0.001), vec2(0.999));
+        float dPos = texture(u_Depth, uvPos).r;
+        vec3 sPos = reconstructViewPos(uvPos, dPos) - viewPos;
+        float lenPos = length(sPos);
+        if (lenPos > 0.001) {
+            float weight = clamp(1.0 - lenPos / worldRadius, 0.0, 1.0);
+            horizonCosPos = max(horizonCosPos, mix(-1.0, dot(sPos / lenPos, viewDir), weight));
+        }
+
+        // Negative direction
+        vec2 uvNeg = clamp(uv - offset, vec2(0.001), vec2(0.999));
+        float dNeg = texture(u_Depth, uvNeg).r;
+        vec3 sNeg = reconstructViewPos(uvNeg, dNeg) - viewPos;
+        float lenNeg = length(sNeg);
+        if (lenNeg > 0.001) {
+            float weight = clamp(1.0 - lenNeg / worldRadius, 0.0, 1.0);
+            horizonCosNeg = max(horizonCosNeg, mix(-1.0, dot(sNeg / lenNeg, viewDir), weight));
         }
     }
 
-    float finalAO = (totalWeight > 0.0001) ? (blurredAO / totalWeight) : centerAO;
-    imageStore(u_OutGTAO, pixelCoord, vec4(clamp(finalAO, 0.0, 1.0), 0.0, 0.0, 1.0));
+    float hPos = acos(clamp(horizonCosPos, -1.0, 1.0));
+    float hNeg = acos(clamp(horizonCosNeg, -1.0, 1.0));
+    float visibility = clamp((sin(hPos) + sin(hNeg) + (hPos + hNeg) * cos(viewNormal.z)) * 0.25, 0.15, 1.0);
+
+    imageStore(u_AoOutput, pixel, vec4(visibility));
 }

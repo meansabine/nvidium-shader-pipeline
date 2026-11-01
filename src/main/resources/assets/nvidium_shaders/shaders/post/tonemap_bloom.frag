@@ -1,34 +1,44 @@
 #version 460 core
 
-// Global Scene Uniform Buffer (std140, binding = 3)
 layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;          // Camera view transform
-    mat4  u_ProjMatrix;          // Camera projection transform
-    mat4  u_ViewProjMatrix;      // Combined View * Projection
-    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (for depth unprojection)
-    mat4  u_CascadeViewProj[3];  // Orthographic View-Projection for 3 shadow cascades
-    vec4  u_CascadeSplits;       // x=Cascade 0 (16m), y=Cascade 1 (64m), z=Cascade 2 (256m), w=Unused
-    vec4  u_SunDirection;        // Normalized vector pointing towards the sun
-    vec4  u_SunColor;            // Sun intensity & spectral color (RGB), intensity multiplier (A)
-    vec4  u_AmbientColor;        // Sky ambient color (RGB)
-    vec4  u_CameraPos;           // World-space camera coordinates (XYZ)
-    vec2  u_ScreenSize;          // Display width, height in pixels
-    vec2  _pad0;                 // std140 alignment padding
-    float u_Time;                // Elapsed game time in seconds
-    int   u_FrameIndex;          // Monotonically increasing frame counter
-    float u_FogStart;            // Vanilla fog start distance in meters
-    float u_FogEnd;              // Vanilla fog end distance in meters
-    vec4  u_FogColor;            // Vanilla fog RGBA color
+    mat4  u_ViewMatrix;
+    mat4  u_ProjMatrix;
+    mat4  u_ViewProjMatrix;
+    mat4  u_InvViewProjMatrix;
+    mat4  u_CascadeViewProj[3];
+    vec4  u_CascadeSplits;
+    vec4  u_SunDirection;
+    vec4  u_SunColor;
+    vec4  u_AmbientColor;
+    vec4  u_CameraPos;
+    vec2  u_ScreenSize;
+    vec2  _pad0;
+    float u_Time;
+    int   u_FrameIndex;
+    float u_FogStart;
+    float u_FogEnd;
+    vec4  u_FogColor;
 };
 
-
-// Input HDR Color (GL_RGBA16F) from Pass 6 specification
 layout(binding = 0) uniform sampler2D u_HdrColorTexture;
 
 layout(location = 0) in vec2 v_Uv;
 layout(location = 0) out vec4 outSrgbColor;
 
-// Recipe F: ACES Filmic Tone Mapping Curve
+const float BLOOM_THRESHOLD = 1.1;
+const float BLOOM_KNEE      = 0.5;
+const float BLOOM_INTENSITY = 0.16;
+const float EXPOSURE        = 1.05;
+
+vec3 extractBrightHighlight(vec3 color) {
+    float brightness = max(max(color.r, color.g), color.b);
+    float soft = brightness - BLOOM_THRESHOLD + BLOOM_KNEE;
+    soft = clamp(soft, 0.0, 2.0 * BLOOM_KNEE);
+    soft = (soft * soft) / (4.0 * BLOOM_KNEE + 0.00001);
+    float contribution = max(soft, brightness - BLOOM_THRESHOLD) / max(brightness, 0.00001);
+    return color * max(contribution, 0.0);
+}
+
 vec3 acesFilm(vec3 x) {
     const float a = 2.51;
     const float b = 0.03;
@@ -38,56 +48,46 @@ vec3 acesFilm(vec3 x) {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 
-// Soft knee luminance threshold for HDR bloom extraction
-vec3 extractBrightPass(vec3 color, float threshold, float knee) {
-    float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-    float soft = clamp(luma - threshold + knee, 0.0, 2.0 * knee);
-    soft = (soft * soft) / (4.0 * knee + 0.0001);
-    float contribution = max(soft, luma - threshold) / max(luma, 0.0001);
-    return color * max(contribution, 0.0);
-}
+void main() {
+    vec2 texelSize = 1.0 / u_ScreenSize;
+    vec3 hdrColor = texture(u_HdrColorTexture, v_Uv).rgb;
 
-// Multi-scale 13-tap Dual-Kawase / Tent Bloom Pyramid Approximation
-vec3 sampleBloomPyramid(vec2 uv) {
-    vec2 texel = 1.0 / u_ScreenSize;
-    vec3 bloom = vec3(0.0);
-    float totalWeight = 0.0;
-
-    const float radii[4]   = float[](1.5, 3.5, 7.5, 14.0);
-    const float weights[4] = float[](0.40, 0.30, 0.20, 0.10);
-    const vec2  dirs[8]    = vec2[](
-        vec2( 1.0,  0.0), vec2(-1.0,  0.0), vec2( 0.0,  1.0), vec2( 0.0, -1.0),
-        vec2( 0.707,  0.707), vec2(-0.707,  0.707), vec2( 0.707, -0.707), vec2(-0.707, -0.707)
+    const float radii[4] = float[4](1.5, 3.5, 7.5, 14.0);
+    const float octaveWeights[4] = float[4](0.40, 0.30, 0.18, 0.12);
+    const vec2 dirs[8] = vec2[8](
+        vec2( 1.0,  0.0),
+        vec2(-1.0,  0.0),
+        vec2( 0.0,  1.0),
+        vec2( 0.0, -1.0),
+        vec2( 0.70710678,  0.70710678),
+        vec2(-0.70710678,  0.70710678),
+        vec2( 0.70710678, -0.70710678),
+        vec2(-0.70710678, -0.70710678)
     );
 
-    for (int octave = 0; octave < 4; ++octave) {
-        float r = radii[octave];
-        float w = weights[octave];
-        vec3 octaveAccum = vec3(0.0);
-        for (int i = 0; i < 8; ++i) {
-            vec2 sampleUv = clamp(uv + dirs[i] * texel * r, vec2(0.001), vec2(0.999));
-            vec3 hdrSample = texture(u_HdrColorTexture, sampleUv).rgb;
-            octaveAccum += extractBrightPass(hdrSample, 1.1, 0.5);
+    vec3 bloomAccum = vec3(0.0);
+    for (int oct = 0; oct < 4; ++oct) {
+        float r = radii[oct];
+        vec3 octaveSum = vec3(0.0);
+        for (int d = 0; d < 8; ++d) {
+            vec2 sampleUv = clamp(v_Uv + dirs[d] * texelSize * r, vec2(0.001), vec2(0.999));
+            vec3 sampleCol = texture(u_HdrColorTexture, sampleUv).rgb;
+            octaveSum += extractBrightHighlight(sampleCol);
         }
-        bloom += (octaveAccum * 0.125) * w;
-        totalWeight += w;
+        bloomAccum += (octaveSum / 8.0) * octaveWeights[oct];
     }
-    return bloom / max(totalWeight, 0.0001);
-}
 
-void main() {
-    vec3 hdrColor = texture(u_HdrColorTexture, v_Uv).rgb;
-    vec3 bloomColor = sampleBloomPyramid(v_Uv);
+    vec3 combinedHdr = (hdrColor + bloomAccum * BLOOM_INTENSITY) * EXPOSURE;
+    vec3 ldrColor = acesFilm(combinedHdr);
 
-    // Composite bloom pyramid & apply exposure
-    const float bloomIntensity = 0.12;
-    const float exposure = 1.05;
-    vec3 exposedHdr = (hdrColor + bloomColor * bloomIntensity) * exposure;
+    ldrColor = smoothstep(vec3(0.0), vec3(1.0), ldrColor) * 0.15 + ldrColor * 0.85;
+    float luma = dot(ldrColor, vec3(0.2126, 0.7152, 0.0722));
+    float maxChan = max(max(ldrColor.r, ldrColor.g), ldrColor.b);
+    float minChan = min(min(ldrColor.r, ldrColor.g), ldrColor.b);
+    float saturation = maxChan - minChan;
+    float vibrance = 0.18 * (1.0 - saturation);
+    ldrColor = clamp(mix(vec3(luma), ldrColor, 1.0 + vibrance), 0.0, 1.0);
 
-    // Apply ACES filmic curve
-    vec3 mapped = acesFilm(exposedHdr);
-
-    // Linear to sRGB gamma encoding
-    vec3 srgb = pow(mapped, vec3(1.0 / 2.2));
-    outSrgbColor = vec4(srgb, 1.0);
+    vec3 srgbColor = pow(ldrColor, vec3(1.0 / 2.2));
+    outSrgbColor = vec4(srgbColor, 1.0);
 }

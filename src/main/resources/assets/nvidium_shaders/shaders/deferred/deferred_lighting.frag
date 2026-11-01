@@ -1,265 +1,251 @@
 #version 460 core
 
-// Global Scene Uniform Buffer (std140, binding = 3)
 layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;          // Camera view transform
-    mat4  u_ProjMatrix;          // Camera projection transform
-    mat4  u_ViewProjMatrix;      // Combined View * Projection
-    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (for depth unprojection)
-    mat4  u_CascadeViewProj[3];  // Orthographic View-Projection for 3 shadow cascades
-    vec4  u_CascadeSplits;       // x=Cascade 0 (16m), y=Cascade 1 (64m), z=Cascade 2 (256m), w=Unused
-    vec4  u_SunDirection;        // Normalized vector pointing towards the sun
-    vec4  u_SunColor;            // Sun intensity & spectral color (RGB), intensity multiplier (A)
-    vec4  u_AmbientColor;        // Sky ambient color (RGB)
-    vec4  u_CameraPos;           // World-space camera coordinates (XYZ)
-    vec2  u_ScreenSize;          // Display width, height in pixels
-    vec2  _pad0;                 // std140 alignment padding
-    float u_Time;                // Elapsed game time in seconds
-    int   u_FrameIndex;          // Monotonically increasing frame counter
-    float u_FogStart;            // Vanilla fog start distance in meters
-    float u_FogEnd;              // Vanilla fog end distance in meters
-    vec4  u_FogColor;            // Vanilla fog RGBA color
+    mat4  u_ViewMatrix;
+    mat4  u_ProjMatrix;
+    mat4  u_ViewProjMatrix;
+    mat4  u_InvViewProjMatrix;
+    mat4  u_CascadeViewProj[3];
+    vec4  u_CascadeSplits;
+    vec4  u_SunDirection;
+    vec4  u_SunColor;
+    vec4  u_AmbientColor;
+    vec4  u_CameraPos;
+    vec2  u_ScreenSize;
+    vec2  _pad0;
+    float u_Time;
+    int   u_FrameIndex;
+    float u_FogStart;
+    float u_FogEnd;
+    vec4  u_FogColor;
 };
 
-
-// G-Buffer and Shadow Map Bindings (Pass 3 specification)
-layout(binding = 0) uniform sampler2D u_AlbedoRoughness;       // From G-Buffer RT0
-layout(binding = 1) uniform sampler2D u_NormalMetallic;        // From G-Buffer RT1
-layout(binding = 2) uniform sampler2D u_LightEmission;         // From G-Buffer RT2
-layout(binding = 3) uniform sampler2D u_Depth;                 // Hardware Scene Depth (GL_DEPTH_COMPONENT32F)
-layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;  // 3-Cascade Shadow Map Array
+layout(binding = 0) uniform sampler2D u_AlbedoRoughness;
+layout(binding = 1) uniform sampler2D u_NormalMetallic;
+layout(binding = 2) uniform sampler2D u_LightEmission;
+layout(binding = 3) uniform sampler2D u_Depth;
+layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
 
 layout(location = 0) in vec2 v_Uv;
 layout(location = 0) out vec4 outHdrColor;
 
 const float PI = 3.14159265359;
 
-// Recipe A: World Position Reconstruction from Depth
+const vec2 POISSON_DISK[16] = vec2[16](
+    vec2(-0.94201624, -0.39906216),
+    vec2( 0.94558609, -0.76890725),
+    vec2(-0.09418410, -0.92938870),
+    vec2( 0.34495938,  0.29387760),
+    vec2(-0.91588581,  0.45771432),
+    vec2(-0.81544232, -0.87912464),
+    vec2(-0.38277543,  0.27676845),
+    vec2( 0.97484398,  0.75648379),
+    vec2( 0.44323325, -0.97511554),
+    vec2( 0.53742981, -0.47373420),
+    vec2(-0.26496911, -0.41893023),
+    vec2( 0.79197514,  0.19090188),
+    vec2(-0.24188840,  0.99706507),
+    vec2(-0.81409955,  0.91437590),
+    vec2( 0.19984126,  0.78641367),
+    vec2( 0.14383161, -0.14100790)
+);
+
 vec3 reconstructWorldPos(vec2 uv, float depth) {
     vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
     vec4 worldPosH = u_InvViewProjMatrix * clip;
     return worldPosH.xyz / worldPosH.w;
 }
 
-// Interleaved Gradient Noise for soft shadow PCF jittering
 float interleavedGradientNoise(vec2 pixelCoord) {
     vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
     float frameOffset = float(u_FrameIndex % 64) * 5.588238;
     return fract(magic.z * fract(dot(pixelCoord + frameOffset, magic.xy)));
 }
 
-// Recipe D: Cascaded Shadow Map Sampling (Hardware PCF + Vogel Disk Soft Filtering)
-float sampleCascadedShadow(vec3 worldPos, vec3 N, vec3 L, float viewDist) {
-    int cascade = (viewDist < u_CascadeSplits.x) ? 0 :
-                  (viewDist < u_CascadeSplits.y) ? 1 : 2;
-
-    // Normal offset bias scaled by cascade size to prevent shadow acne
-    float cascadeScale = (cascade == 0) ? 0.015 : (cascade == 1) ? 0.045 : 0.12;
-    float NdotL = max(dot(N, L), 0.0);
-    vec3 biasedPos = worldPos + N * cascadeScale * (1.0 - NdotL * 0.7);
-
-    vec4 shadowClip = u_CascadeViewProj[cascade] * vec4(biasedPos, 1.0);
-    vec3 shadowCoord = shadowClip.xyz / shadowClip.w * 0.5 + 0.5;
-
-    // Discard out-of-bounds coordinates
-    if (shadowCoord.x < 0.0 || shadowCoord.x > 1.0 ||
-        shadowCoord.y < 0.0 || shadowCoord.y > 1.0 ||
-        shadowCoord.z > 1.0) {
-        return 1.0;
-    }
-
-    // 4-sample rotated/jittered PCF per Recipe D with temporal noise rotation
-    float angle = interleavedGradientNoise(gl_FragCoord.xy) * 2.0 * PI;
-    float s = sin(angle);
-    float c = cos(angle);
-    mat2 rot = mat2(c, -s, s, c);
-
-    float shadow = 0.0;
-    vec2 texelSize = vec2(1.0 / 2048.0);
-    for (int x = -1; x <= 1; x += 2) {
-        for (int y = -1; y <= 1; y += 2) {
-            vec2 offset = rot * (vec2(x, y) * texelSize * 0.75);
-            shadow += texture(u_ShadowMap, vec4(shadowCoord.xy + offset, float(cascade), shadowCoord.z - 0.0015));
-        }
-    }
-    return shadow * 0.25;
-}
-
-// Recipe E: Cook-Torrance Microfacet GGX BRDF
 float distributionGGX(vec3 N, vec3 H, float roughness) {
     float a = roughness * roughness;
     float a2 = a * a;
     float NdotH = max(dot(N, H), 0.0);
-    float denom = (NdotH * NdotH * (a2 - 1.0) + 1.0);
-    return a2 / (PI * denom * denom);
+    float NdotH2 = NdotH * NdotH;
+    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+    return a2 / (PI * denom * denom + 0.00001);
 }
 
 float geometrySchlickGGX(float NdotV, float roughness) {
-    float r = roughness + 1.0;
+    float r = (roughness + 1.0);
     float k = (r * r) / 8.0;
     return NdotV / (NdotV * (1.0 - k) + k);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    return geometrySchlickGGX(max(dot(N, V), 0.0), roughness) *
-           geometrySchlickGGX(max(dot(N, L), 0.0), roughness);
 }
 
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
-vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {
-    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+vec3 renderAtmosphericSky(vec3 viewDir, vec3 sunDir) {
+    float elevation = clamp(viewDir.y, 0.0, 1.0);
+    vec3 zenithColor = max(u_AmbientColor.rgb * 1.25, vec3(0.10, 0.25, 0.58));
+    vec3 horizonColor = mix(u_FogColor.rgb, u_SunColor.rgb * 0.6, 0.2);
+    vec3 sky = mix(horizonColor, zenithColor, pow(elevation, 0.6));
+
+    float cosTheta = dot(viewDir, sunDir);
+    float g = 0.78;
+    float miePhase = (1.0 - g * g) / (4.0 * PI * pow(1.0 + g * g - 2.0 * g * max(cosTheta, 0.0), 1.5));
+    sky += u_SunColor.rgb * u_SunColor.a * miePhase * 0.12;
+
+    float sunDisk = smoothstep(0.9993, 0.99985, cosTheta);
+    sky += u_SunColor.rgb * u_SunColor.a * sunDisk * 18.0;
+
+    return sky;
 }
 
-vec3 evaluatePbrBRDF(vec3 N, vec3 V, vec3 L, vec3 albedo, float roughness, float metallic, vec3 lightColor) {
-    vec3 H = normalize(V + L);
-    float NdotL = max(dot(N, L), 0.0);
-    float NdotV = max(dot(N, V), 0.0);
-    if (NdotL <= 0.0 || NdotV <= 0.0) return vec3(0.0);
+float sampleCascadedShadowPCF(vec3 worldPos, vec3 N, vec3 L, float viewDist) {
+    int cascadeIdx = 2;
+    if (viewDist < u_CascadeSplits.x) cascadeIdx = 0;
+    else if (viewDist < u_CascadeSplits.y) cascadeIdx = 1;
 
-    vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    float NDF = distributionGGX(N, H, roughness);
-    float G = geometrySmith(N, V, L, roughness);
-    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    float normalOffsetScale = (cascadeIdx == 0) ? 0.025 : ((cascadeIdx == 1) ? 0.065 : 0.15);
+    vec3 offsetPos = worldPos + N * normalOffsetScale * clamp(1.0 - dot(N, L), 0.15, 1.0);
 
-    vec3 specular = (NDF * G * F) / (4.0 * NdotV * NdotL + 0.0001);
-    vec3 kD = (vec3(1.0) - F) * (1.0 - metallic);
-    return (kD * albedo / PI + specular) * lightColor * NdotL;
+    vec4 shadowClip = u_CascadeViewProj[cascadeIdx] * vec4(offsetPos, 1.0);
+    vec3 shadowNdc = shadowClip.xyz / shadowClip.w;
+    vec3 shadowUv = shadowNdc * 0.5 + 0.5;
+
+    if (shadowUv.x <= 0.001 || shadowUv.x >= 0.999 || shadowUv.y <= 0.001 || shadowUv.y >= 0.999 || shadowUv.z >= 1.0) {
+        return 1.0;
+    }
+
+    float angle = interleavedGradientNoise(gl_FragCoord.xy) * 2.0 * PI;
+    float s = sin(angle);
+    float c = cos(angle);
+    mat2 rot = mat2(c, -s, s, c);
+
+    float filterRadius = (cascadeIdx == 0) ? (1.75 / 2048.0) : ((cascadeIdx == 1) ? (1.35 / 2048.0) : (1.0 / 2048.0));
+    float slopeBias = max(0.00075 * (1.0 - dot(N, L)), 0.00025) * float(cascadeIdx + 1);
+
+    float shadowSum = 0.0;
+    for (int i = 0; i < 16; ++i) {
+        vec2 offset = (rot * POISSON_DISK[i]) * filterRadius;
+        shadowSum += texture(u_ShadowMap, vec4(shadowUv.xy + offset, float(cascadeIdx), shadowUv.z - slopeBias));
+    }
+
+    return shadowSum / 16.0;
 }
 
-// Screen-space micro-crevice ambient occlusion from depth & normal gradients
 float computeMicroCreviceAO(vec2 uv, vec3 worldPos, vec3 N, float viewDist) {
-    vec2 texel = 1.0 / u_ScreenSize;
+    vec2 texelSize = 1.0 / u_ScreenSize;
     float ao = 0.0;
-    const vec2 offsets[4] = vec2[](
-        vec2( 1.0,  0.0), vec2(-1.0,  0.0),
-        vec2( 0.0,  1.0), vec2( 0.0, -1.0)
-    );
-    float radius = clamp(2.5 / max(viewDist, 1.0), 1.0, 4.0);
+    const vec2 dirs[4] = vec2[4](vec2(1.0, 0.0), vec2(-1.0, 0.0), vec2(0.0, 1.0), vec2(0.0, -1.0));
+    float radius = clamp(2.5 / max(viewDist * 0.15, 1.0), 1.0, 4.0);
+
     for (int i = 0; i < 4; ++i) {
-        vec2 sampleUv = uv + offsets[i] * texel * radius;
+        vec2 sampleUv = uv + dirs[i] * texelSize * radius;
         float sampleDepth = texture(u_Depth, sampleUv).r;
-        if (sampleDepth >= 1.0) continue;
+        if (sampleDepth >= 0.999999) continue;
+
         vec3 samplePos = reconstructWorldPos(sampleUv, sampleDepth);
         vec3 diff = samplePos - worldPos;
         float dist = length(diff);
-        if (dist > 0.0001 && dist < 1.25) {
-            ao += max(0.0, dot(N, diff / dist) - 0.05) * (1.0 - dist / 1.25);
+        if (dist > 0.001 && dist < 1.25) {
+            float horizon = max(dot(N, diff / dist) - 0.08, 0.0);
+            float attenuation = 1.0 - clamp(dist / 1.25, 0.0, 1.0);
+            ao += horizon * attenuation;
         }
     }
-    return clamp(1.0 - (ao * 0.35), 0.25, 1.0);
-}
-
-// Procedural atmospheric sky gradient for background & fog blending
-vec3 evaluateAtmosphericSky(vec3 viewDir, vec3 sunDir, vec3 sunRadiance, vec3 ambientSky) {
-    float zenith = clamp(viewDir.y, 0.0, 1.0);
-    vec3 horizonColor = mix(u_FogColor.rgb, ambientSky * 1.35, 0.5);
-    vec3 zenithColor  = ambientSky * 0.75;
-    vec3 sky = mix(horizonColor, zenithColor, pow(zenith, 0.6));
-
-    // Solar disk & Mie aureole
-    float sunDot = max(dot(viewDir, sunDir), 0.0);
-    vec3 mieGlow = sunRadiance * 0.15 * pow(sunDot, 16.0);
-    vec3 sunDisk = sunRadiance * 4.0 * smoothstep(0.9993, 0.9998, sunDot);
-    return sky + mieGlow + sunDisk;
+    return clamp(1.0 - ao * 0.55, 0.25, 1.0);
 }
 
 void main() {
     float depth = texture(u_Depth, v_Uv).r;
-    vec3 L_sun = normalize(u_SunDirection.xyz);
-    vec3 sunRadiance = u_SunColor.rgb * u_SunColor.a;
+    vec3 worldPos = reconstructWorldPos(v_Uv, depth);
+    vec3 viewVec = worldPos - u_CameraPos.xyz;
+    float viewDist = length(viewVec);
+    vec3 V = -normalize(viewVec);
+    vec3 L = normalize(u_SunDirection.xyz);
 
-    // Sky pixels (far plane depth == 1.0)
     if (depth >= 0.999999) {
-        vec3 worldFar = reconstructWorldPos(v_Uv, 1.0);
-        vec3 viewDir = normalize(worldFar - u_CameraPos.xyz);
-        vec3 skyColor = evaluateAtmosphericSky(viewDir, L_sun, sunRadiance, u_AmbientColor.rgb);
-        outHdrColor = vec4(skyColor, 1.0);
+        outHdrColor = vec4(renderAtmosphericSky(-V, L), 1.0);
         return;
     }
 
-    // Unpack G-Buffer MRTs
     vec4 albedoRoughness = texture(u_AlbedoRoughness, v_Uv);
     vec4 normalMetallic  = texture(u_NormalMetallic, v_Uv);
     vec4 lightEmission   = texture(u_LightEmission, v_Uv);
 
-    // Fallback A: When rendered with Nvidium's default shader, Attachment 0 contains
-    // pre-lit vanilla diffuse, while normal and light buffers are unwritten (0).
-    // In that case, output the pre-lit color directly so terrain is always 100% visible!
     if (length(lightEmission.rg) < 0.001 && length(normalMetallic.xyz) < 0.01) {
-        outHdrColor = vec4(albedoRoughness.rgb, 1.0);
+        outHdrColor = vec4(pow(albedoRoughness.rgb, vec3(2.2)), 1.0);
         return;
     }
 
-    vec3 worldPos = reconstructWorldPos(v_Uv, depth);
-    vec3 V = normalize(u_CameraPos.xyz - worldPos);
-    float viewDist = length(u_CameraPos.xyz - worldPos);
+    vec3 albedo = pow(max(albedoRoughness.rgb, vec3(0.0)), vec3(2.2));
+    float roughness = clamp(albedoRoughness.a, 0.04, 1.0);
+    float metallic  = clamp(normalMetallic.a, 0.0, 1.0);
 
-    // Fallback B: If normal texture is unwritten, derive geometric normal from screen derivatives
+    vec3 rawNormal = normalMetallic.xyz;
     vec3 N;
-    if (length(normalMetallic.xyz) < 0.01) {
-        vec3 dX = dFdx(worldPos);
-        vec3 dY = dFdy(worldPos);
-        N = normalize(cross(dY, dX));
+    if (length(rawNormal) < 0.01) {
+        N = normalize(cross(dFdx(worldPos), dFdy(worldPos)));
     } else {
-        N = normalize(normalMetallic.rgb * 2.0 - 1.0);
+        vec3 decoded = (rawNormal.x < -0.001 || rawNormal.y < -0.001 || rawNormal.z < -0.001)
+                       ? rawNormal
+                       : (rawNormal * 2.0 - 1.0);
+        N = normalize(decoded);
     }
 
-    vec3  albedo     = albedoRoughness.rgb;
-    float roughness  = clamp(albedoRoughness.a, 0.04, 1.0);
-    float metallic   = clamp(normalMetallic.a, 0.0, 1.0);
-    float blockLight = lightEmission.r;
-    float skyLight   = lightEmission.g;
-    float emissive   = lightEmission.b;
+    float blockLight = clamp(lightEmission.r, 0.0, 1.0);
+    float skyLight   = clamp(lightEmission.g, 0.0, 1.0);
+    float emission   = clamp(lightEmission.b, 0.0, 1.0);
 
-    // 1. PBR Cook-Torrance GGX Direct Sunlight with Soft Cascaded PCF Shadows
-    float shadow = sampleCascadedShadow(worldPos, N, L_sun, viewDist);
-    vec3 directSun = evaluatePbrBRDF(N, V, L_sun, albedo, roughness, metallic, sunRadiance) * shadow;
-
-    // 2. Dynamic Colored Torchlight with Inverse-Square Physical Falloff
-    // Convert normalized Minecraft block light [0, 1] (0..15 levels) to physical distance
-    float lightDeficit = (1.0 - blockLight) * 15.0;
-    float torchDist = max(0.65, lightDeficit + 0.65);
-    float inverseSquareAtten = pow(blockLight, 2.0) / (torchDist * torchDist + 0.35);
-    // Subtle warm blackbody flicker (~2400K-2900K)
-    float flicker = 1.0 + 0.03 * sin(u_Time * 11.0 + worldPos.x * 2.3 + worldPos.z * 2.7);
-    vec3 torchSpectrum = mix(vec3(1.0, 0.36, 0.08), vec3(1.0, 0.72, 0.35), blockLight);
-    vec3 torchRadiance = torchSpectrum * (inverseSquareAtten * 18.0 * flicker);
-    // Approximate local light direction lifted slightly toward viewer & surface normal
-    vec3 L_torch = normalize(N + V * 0.45 + vec3(0.0, 0.35, 0.0));
-    vec3 torchLighting = evaluatePbrBRDF(N, V, L_torch, albedo, roughness, metallic, torchRadiance);
-
-    // 3. Realistic Atmospheric Skylight with Subtle Ambient Occlusion
-    float microAO = computeMicroCreviceAO(v_Uv, worldPos, N, viewDist);
-    float cavityAO = mix(0.35, 1.0, skyLight * skyLight) * microAO;
-    float hemiFactor = N.y * 0.5 + 0.5;
-    vec3 groundBounce = u_AmbientColor.rgb * 0.22;
-    vec3 hemiSkyColor = mix(groundBounce, u_AmbientColor.rgb, hemiFactor);
+    vec3 H = normalize(V + L);
+    float NdotV = max(dot(N, V), 0.001);
+    float NdotL = max(dot(N, L), 0.0);
 
     vec3 F0 = mix(vec3(0.04), albedo, metallic);
-    vec3 kS_amb = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);
-    vec3 kD_amb = (1.0 - kS_amb) * (1.0 - metallic);
-    vec3 ambientDiffuse  = kD_amb * albedo * hemiSkyColor;
-    vec3 ambientSpecular = kS_amb * hemiSkyColor * (1.0 - roughness * 0.75);
-    vec3 ambientLighting = (ambientDiffuse + ambientSpecular) * (skyLight * skyLight * cavityAO) + (albedo * 0.008 * microAO);
+    vec3 F  = fresnelSchlick(max(dot(H, V), 0.0), F0);
+    float D = distributionGGX(N, H, roughness);
+    float G = geometrySchlickGGX(NdotV, roughness) * geometrySchlickGGX(max(NdotL, 0.001), roughness);
 
-    // LabPBR Emissive surfaces
-    vec3 emissionLighting = albedo * (emissive * emissive * 24.0);
+    vec3 specular = (D * G * F) / max(4.0 * NdotV * max(NdotL, 0.001), 0.001);
+    vec3 kS = F;
+    vec3 kD = (vec3(1.0) - kS) * (1.0 - metallic);
 
-    vec3 litColor = directSun + torchLighting + ambientLighting + emissionLighting;
+    float shadow = (NdotL > 0.0) ? sampleCascadedShadowPCF(worldPos, N, L, viewDist) : 0.0;
+    shadow *= smoothstep(0.02, 0.25, skyLight);
 
-    // 4. Smooth Distance Fog Blending into the Atmospheric Sky Color
-    vec3 viewDir = -V;
-    vec3 skyHorizonColor = evaluateAtmosphericSky(viewDir, L_sun, sunRadiance, u_AmbientColor.rgb);
-    vec3 fogTargetColor = mix(u_FogColor.rgb, skyHorizonColor, 0.65);
+    vec3 sunRadiance = u_SunColor.rgb * max(u_SunColor.a, 1.0);
+    vec3 directLighting = (kD * albedo / PI + specular) * sunRadiance * NdotL * shadow;
 
-    float fogSpan = max(u_FogEnd - u_FogStart, 0.001);
-    float linearFog = smoothstep(u_FogStart, u_FogEnd, viewDist);
-    float expFog = 1.0 - exp(-max(0.0, viewDist - u_FogStart * 0.35) * (1.75 / max(u_FogEnd, 32.0)));
-    float fogFactor = clamp(mix(expFog, linearFog, 0.45), 0.0, 1.0);
+    float torchDist = max((1.0 - blockLight) * 15.0, 0.35);
+    float window = clamp(1.0 - pow(torchDist / 15.0, 4.0), 0.0, 1.0);
+    window = window * window;
+    float attenuation = window / (torchDist * torchDist + 0.85);
 
-    vec3 finalHdr = mix(litColor, fogTargetColor, fogFactor);
-    outHdrColor = vec4(max(finalHdr, vec3(0.0)), 1.0);
+    float flicker = 1.0 + 0.035 * sin(u_Time * 13.7 + worldPos.x * 2.3 + worldPos.z * 1.9)
+                        + 0.020 * cos(u_Time * 23.1 - worldPos.y * 3.1);
+    vec3 emberColor = vec3(1.0, 0.28, 0.04);
+    vec3 flameColor = vec3(1.0, 0.68, 0.32);
+    vec3 torchSpectrum = mix(emberColor, flameColor, pow(blockLight, 1.35));
+    vec3 torchLighting = albedo * torchSpectrum * attenuation * flicker * 3.4;
+
+    float creviceAO = computeMicroCreviceAO(v_Uv, worldPos, N, viewDist);
+    float hemiFactor = N.y * 0.5 + 0.5;
+    vec3 groundBounce = u_AmbientColor.rgb * vec3(0.45, 0.38, 0.30);
+    vec3 skyZenith    = u_AmbientColor.rgb * vec3(0.85, 0.95, 1.15);
+    vec3 hemiIrradiance = mix(groundBounce, skyZenith, hemiFactor);
+
+    float caveBaseAmbient = 0.018;
+    vec3 ambientLighting = kD * albedo * (hemiIrradiance * (skyLight * skyLight) + vec3(caveBaseAmbient)) * creviceAO;
+
+    vec3 emissiveLighting = albedo * (emission * emission) * 12.0;
+
+    vec3 totalColor = directLighting + torchLighting + ambientLighting + emissiveLighting;
+
+    float fogRange = max(u_FogEnd - u_FogStart, 1.0);
+    float fogDist  = max(viewDist - u_FogStart * 0.65, 0.0);
+    float expFog   = 1.0 - exp(-pow(fogDist / fogRange, 1.65) * 2.8);
+    vec3 horizonSky = renderAtmosphericSky(normalize(vec3(viewVec.x, max(viewVec.y, 0.02), viewVec.z)), L);
+    vec3 fogTarget  = mix(u_FogColor.rgb, horizonSky, 0.45);
+
+    totalColor = mix(totalColor, fogTarget, clamp(expFog, 0.0, 1.0));
+
+    outHdrColor = vec4(max(totalColor, vec3(0.0)), 1.0);
 }
