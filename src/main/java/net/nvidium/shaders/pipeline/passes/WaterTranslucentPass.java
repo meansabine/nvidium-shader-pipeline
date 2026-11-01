@@ -67,6 +67,10 @@ public class WaterTranslucentPass implements IShaderPass {
             GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, pipeline.getGbuffer().getDepthTex());
             waterShader.setUniform1i("u_SceneDepth", 1);
 
+            // Bind shadow map: Unit 4
+            pipeline.getShadowMap().bindTexture(4);
+            waterShader.setUniform1i("u_ShadowMap", 4);
+
             // Hook for Nvidium's TranslucentTerrainRasterizer here
             ShaderProgram.unbind();
         }

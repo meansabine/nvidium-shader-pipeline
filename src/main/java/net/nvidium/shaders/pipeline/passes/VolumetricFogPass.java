@@ -57,14 +57,14 @@ public class VolumetricFogPass implements IShaderPass {
 
         fogShader.bind();
 
-        // Bind Depth Texture: Unit 0
-        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+        // Bind Depth Texture: Unit 3
+        GL13C.glActiveTexture(GL13C.GL_TEXTURE3);
         GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, pipeline.getGbuffer().getDepthTex());
-        fogShader.setUniform1i("u_DepthTexture", 0);
+        fogShader.setUniform1i("u_Depth", 3);
 
-        // Bind Shadow Map: Unit 1
-        pipeline.getShadowMap().bindTexture(1);
-        fogShader.setUniform1i("u_ShadowMap", 1);
+        // Bind Shadow Map: Unit 4
+        pipeline.getShadowMap().bindTexture(4);
+        fogShader.setUniform1i("u_ShadowMap", 4);
 
         FullscreenQuad.render();
         ShaderProgram.unbind();

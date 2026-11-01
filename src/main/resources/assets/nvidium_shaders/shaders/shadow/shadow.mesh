@@ -1,25 +1,81 @@
 #version 460 core
-
 #extension GL_NV_mesh_shader : require
 #extension GL_NV_gpu_shader5 : require
-#extension GL_KHR_shader_subgroup_arithmetic : require
 
-layout(local_size_x = 16) in;
-layout(triangles, max_vertices = 64, max_primitives = 32) out;
-
-// Scene uniforms including cascade matrices
-#include <nvidium_shaders:common/scene_uniforms.glsl>
-
-uniform int u_CascadeIndex;
-
-taskNV in Task {
-    uint baseOffset;
-    uint quadCount;
+// Global Scene Uniform Buffer (std140, binding = 3)
+layout(std140, binding = 3) uniform SceneUniforms {
+    mat4  u_ViewMatrix;          // Camera view transform
+    mat4  u_ProjMatrix;          // Camera projection transform
+    mat4  u_ViewProjMatrix;      // Combined View * Projection
+    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (for depth unprojection)
+    mat4  u_CascadeViewProj[3];  // Orthographic View-Projection for 3 shadow cascades
+    vec4  u_CascadeSplits;       // x=Cascade 0 (16m), y=Cascade 1 (64m), z=Cascade 2 (256m), w=Unused
+    vec4  u_SunDirection;        // Normalized vector pointing towards the sun
+    vec4  u_SunColor;            // Sun intensity & spectral color (RGB), intensity multiplier (A)
+    vec4  u_AmbientColor;        // Sky ambient color (RGB)
+    vec4  u_CameraPos;           // World-space camera coordinates (XYZ)
+    vec2  u_ScreenSize;          // Display width, height in pixels
+    vec2  _pad0;                 // std140 alignment padding
+    float u_Time;                // Elapsed game time in seconds
+    int   u_FrameIndex;          // Monotonically increasing frame counter
+    float u_FogStart;            // Vanilla fog start distance in meters
+    float u_FogEnd;              // Vanilla fog end distance in meters
+    vec4  u_FogColor;            // Vanilla fog RGBA color
 };
 
+
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 64, max_primitives = 32) out;
+
+// Cascade index push constant / uniform
+layout(location = 0) uniform int u_CascadeIndex;
+
+// Nvidium compressed 16-byte terrain vertex format
+struct NvidiumVertex {
+    uint16_t posX, posY, posZ;
+    uint16_t packedLightAndFlags;
+    uint16_t texU, texV;
+    uint32_t packedColor;
+};
+
+layout(std430, binding = 0) restrict readonly buffer VertexBuffer {
+    NvidiumVertex vertices[];
+};
+
+layout(location = 0) out PerVertexData {
+    vec2 v_TexCoord;
+} v_out[];
+
 void main() {
-    if (gl_LocalInvocationIndex == 0) {
-        gl_PrimitiveCountNV = 0;
+    uint laneId = gl_LocalInvocationID.x;
+    uint baseQuad = gl_WorkGroupID.x * 16u;
+
+    // Each thread processes up to 2 vertices (16 quads = 64 vertices, 32 triangles)
+    for (uint i = laneId; i < 64u; i += 32u) {
+        NvidiumVertex v = vertices[baseQuad * 4u + i];
+        vec3 worldPos = vec3(float(v.posX), float(v.posY), float(v.posZ)) / 256.0;
+        vec2 uv = vec2(float(v.texU), float(v.texV)) / 32768.0;
+
+        gl_MeshVerticesNV[i].gl_Position = u_CascadeViewProj[clamp(u_CascadeIndex, 0, 2)] * vec4(worldPos, 1.0);
+        v_out[i].v_TexCoord = uv;
     }
-    // High-speed depth-only mesh pass transforms vertices by u_CascadeViewProj[u_CascadeIndex]
+
+    if (laneId < 16u) {
+        uint vBase = laneId * 4u;
+        uint pBase = laneId * 2u;
+        // Triangle 0
+        gl_PrimitiveIndicesNV[pBase * 3u + 0u] = vBase + 0u;
+        gl_PrimitiveIndicesNV[pBase * 3u + 1u] = vBase + 1u;
+        gl_PrimitiveIndicesNV[pBase * 3u + 2u] = vBase + 2u;
+        gl_MeshPrimitivesNV[pBase + 0u].gl_Layer = u_CascadeIndex;
+        // Triangle 1
+        gl_PrimitiveIndicesNV[pBase * 3u + 3u] = vBase + 2u;
+        gl_PrimitiveIndicesNV[pBase * 3u + 4u] = vBase + 3u;
+        gl_PrimitiveIndicesNV[pBase * 3u + 5u] = vBase + 0u;
+        gl_MeshPrimitivesNV[pBase + 1u].gl_Layer = u_CascadeIndex;
+    }
+
+    if (laneId == 0u) {
+        gl_PrimitiveCountNV = 32u;
+    }
 }
