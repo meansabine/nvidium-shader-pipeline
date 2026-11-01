@@ -1,111 +1,184 @@
-# Nvidium Shader Pipeline (NSP) - Complete AI Master Guide & Generator Prompts
-> **Document Purpose:** Feed this entire document directly to Google Gemini AI (or any state-of-the-art LLM on the web) to generate production-ready, breathtaking GLSL 4.60 shaders tailored specifically for the Nvidium GPU Mesh Shader Architecture.
+# Nvidium Shader Pipeline (NSP) Technical Specification & Interface Guide
+
+This document is a technical reference for the Nvidium Shader Pipeline (NSP). It describes the accessible GPU resources, uniform layouts, texture binding slots, render passes, and data contracts required to implement or generate shaders for this architecture.
 
 ---
 
-## 1. Executive Summary & Diagnostic: Why Was Water & Shaders Not Working?
+## 1. Pipeline Architecture & Execution Flow
 
-If shaders previously looked identical to vanilla Minecraft or water was completely standard, here is the exact architectural reason:
-1. **The Fallback Safety Trap:** In earlier versions, Nvidium's default fragment shader only wrote diffuse color to Attachment 0 (`colour`), leaving Normals (Attachment 1) and Lights (Attachment 2) blank (`0.0`). The deferred lighting shader detected that lights and normals were empty and safely fell back to outputting vanilla pre-lit color so the game wouldn't be black.
-2. **Water / Translucency Was Unhooked:** In Nvidium, opaque terrain and translucent terrain (water, stained glass) are handled by separate rasterizers (`PrimaryTerrainRasterizer` vs `TranslucentTerrainRasterizer`). The translucent rasterizer was hardcoded to run Nvidium's vanilla water shader and never executed the custom water pass.
-3. **The Solution in this Guide:** This document specifies how Nvidium's Mesh Shaders feed real G-Buffer Multiple Render Targets (MRT), how the Deferred Lighting pass performs physical Cook-Torrance GGX + Cascaded Shadows + $1/r^2$ Torchlight, and how the Water Shader samples the opaque scene color and depth to execute true Beer-Lambert optical absorption, Gerstner waves, and Screen-Space Reflections (SSR).
+Rendering proceeds sequentially across 6 distinct phases:
+
+```
+[Nvidium Mesh Shader Rasterizer]
+             │
+             ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 1: Opaque Terrain G-Buffer (MRT)                 │
+│ Output: GBuffer FBO (Attachments 0, 1, 2 + Depth)      │
+└────────────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 2: Cascaded Shadow Map (CSM)                     │
+│ Output: 3-layer 2048x2048 Depth Array (Binding 4)      │
+└────────────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 3: Deferred Lighting Pass                        │
+│ Input:  GBuffer Attachments 0-3, Shadow Map (Unit 4)   │
+│ Output: HDR Color Buffer (GL_RGBA16F)                  │
+└────────────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 4: Volumetric Fog Pass                           │
+│ Input:  Depth (Unit 3), Shadow Map (Unit 4)            │
+│ Output: Additive blend into HDR Color Buffer           │
+└────────────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 5: Translucent Terrain / Water                   │
+│ Input:  Opaque Scene Color (Unit 0), Depth (Unit 1)    │
+│ Output: Rendered into Minecraft Main FBO               │
+└────────────────────────────────────────────────────────┘
+             │
+             ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 6: Post-Process, Bloom & Tonemapping             │
+│ Input:  HDR Color Buffer (Unit 0)                      │
+│ Output: Minecraft Display Framebuffer (sRGB)           │
+└────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 2. Global Scene Uniform Buffer (`std140`, binding = 3)
 
-All shaders have access to the global engine and camera state through uniform buffer binding point **`3`** (binding point 0 is strictly reserved for Nvidium's internal 64-bit unified GPU memory pointers).
+All shaders access global engine state via uniform buffer binding point **3**.  
+*(Note: Binding point 0 is reserved for Nvidium's 64-bit unified GPU memory pointers).*
 
 ```glsl
-// Global Scene Uniform Buffer (std140, binding = 3)
 layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;          // Camera view transform
-    mat4  u_ProjMatrix;          // Camera projection transform
-    mat4  u_ViewProjMatrix;      // Combined View * Projection
-    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (for depth unprojection)
+    mat4  u_ViewMatrix;          // Camera view matrix
+    mat4  u_ProjMatrix;          // Camera projection matrix
+    mat4  u_ViewProjMatrix;      // Combined View * Projection matrix
+    mat4  u_InvViewProjMatrix;   // Inverse View-Projection (clip to world space)
     mat4  u_CascadeViewProj[3];  // Orthographic View-Projection for 3 shadow cascades
-    vec4  u_CascadeSplits;       // x=Cascade 0 (16m), y=Cascade 1 (64m), z=Cascade 2 (256m), w=Unused
+    vec4  u_CascadeSplits;       // x = Cascade 0 (16m), y = Cascade 1 (64m), z = Cascade 2 (256m), w = unused
     vec4  u_SunDirection;        // Normalized vector pointing towards the sun
-    vec4  u_SunColor;            // Sun intensity & spectral color (RGB), intensity multiplier (A)
+    vec4  u_SunColor;            // Sun color (RGB), intensity multiplier (A)
     vec4  u_AmbientColor;        // Sky ambient color (RGB)
-    vec4  u_CameraPos;           // World-space camera coordinates (XYZ)
-    vec2  u_ScreenSize;          // Display width, height in pixels
-    vec2  _pad0;                 // std140 alignment padding
+    vec4  u_CameraPos;           // World-space camera position (XYZ)
+    vec2  u_ScreenSize;          // Viewport width, height in pixels
+    vec2  _pad0;                 // std140 16-byte alignment padding
     float u_Time;                // Elapsed game time in seconds
-    int   u_FrameIndex;          // Monotonically increasing frame counter
-    float u_FogStart;            // Vanilla fog start distance in meters
-    float u_FogEnd;              // Vanilla fog end distance in meters
-    vec4  u_FogColor;            // Vanilla fog RGBA color
+    int   u_FrameIndex;          // Monotonically increasing frame index
+    float u_FogStart;            // Fog start distance in meters
+    float u_FogEnd;              // Fog end distance in meters
+    vec4  u_FogColor;            // Fog RGBA color
 };
 ```
 
 ---
 
-## 3. Pipeline Architecture & G-Buffer Layout
+## 3. Pass Interfaces & Resource Bindings
 
-The Nvidium Shader Pipeline executes in 6 distinct sequential stages:
-
-```
-[ Nvidium Mesh Shaders ]
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ PASS 1: G-Buffer MRT Generation                        │
-│ - Attachment 0 (GL_RGBA16F): Albedo (RGB) + Roughness  │
-│ - Attachment 1 (GL_RGBA16F): Normal (XYZ) + Metalness  │
-│ - Attachment 2 (GL_RGBA16F): BlockLight, SkyLight, Emit│
-│ - Depth (GL_DEPTH_COMPONENT24): Scene Hardware Depth   │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ PASS 2: Cascaded Shadow Map (CSM)                      │
-│ - 3 Cascades (16m, 64m, 256m) at 2048x2048 Array       │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ PASS 3: Deferred PBR Lighting (Fullscreen Quad)        │
-│ - Cook-Torrance GGX Specular + Lambertian Diffuse      │
-│ - Cascaded Soft PCF Shadows (Poisson disk)             │
-│ - Dynamic Colored Torchlight (Physical 1/r² Falloff)   │
-│ - Atmospheric Skylight & Contact Crevice AO            │
-│ - Output: HDR Color Texture (GL_RGBA16F)               │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ PASS 4: Volumetric God Rays (Raymarched Fog)           │
-│ - 32-step Mie forward scattering sun shafts            │
-│ - Additively blended directly into HDR Color           │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ PASS 5: Physical Water & Translucency                  │
-│ - Reads Opaque Lit Color & Depth                       │
-│ - Multi-octave Gerstner wave normal displacement       │
-│ - Depth-based Beer-Lambert light extinction            │
-│ - Screen-Space Reflections (SSR) + Fresnel reflection  │
-│ - Sun specular glitter highlight                       │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ PASS 6: Post-Processing, Bloom & ACES Tonemapping      │
-│ - 4-octave Dual-Kawase HDR Bloom pyramid               │
-│ - ACES Filmic Curve + Gamma 2.2 Encoding               │
-│ - Outputs final sRGB to Minecraft's main display FBO   │
-└────────────────────────────────────────────────────────┘
-```
+### 3.1 G-Buffer (Multiple Render Targets)
+* **FBO:** `pipeline.getGbuffer()`
+* **Color Attachments:**
+  * `layout(location = 0) out vec4 outAlbedoRoughness;`
+    * RGB: Albedo color
+    * A: Roughness $[0.04, 1.0]$
+  * `layout(location = 1) out vec4 outNormalMetallic;`
+    * RGB: Surface normal vector (encoded as $N \cdot 0.5 + 0.5$ or $[-1.0, 1.0]$)
+    * A: Metalness $[0.0, 1.0]$
+  * `layout(location = 2) out vec4 outLightEmission;`
+    * R: Normalized block light level $[0.0, 1.0]$ ($0 = \text{dark}, 1.0 = \text{level 15}$)
+    * G: Normalized sky light level $[0.0, 1.0]$ ($0 = \text{underground}, 1.0 = \text{open sky}$)
+    * B: Material emission factor $[0.0, 1.0]$
+    * A: Material flag (1.0 = terrain)
+* **Depth Attachment:** Hardware depth (`GL_DEPTH_COMPONENT24`, shared with Minecraft's main depth buffer).
 
 ---
 
-## 4. Standard Reusable Shader Algorithms (GLSL 4.60)
+### 3.2 Deferred Lighting Pass (`deferred_lighting.frag`)
+* **Vertex Shader:** `shaders/common/fullscreen.vert` (Generates screen-covering triangle from `gl_VertexID`).
+* **Fragment Shader:** `shaders/deferred/deferred_lighting.frag`
+* **Framebuffer:** HDR FBO (`GL_RGBA16F`, attachment 0). Depth test disabled, depth write disabled.
+* **Samplers:**
+  ```glsl
+  layout(binding = 0) uniform sampler2D u_AlbedoRoughness;
+  layout(binding = 1) uniform sampler2D u_NormalMetallic;
+  layout(binding = 2) uniform sampler2D u_LightEmission;
+  layout(binding = 3) uniform sampler2D u_Depth;
+  layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
+  ```
+* **Inputs & Outputs:**
+  ```glsl
+  layout(location = 0) in vec2 v_Uv;
+  layout(location = 0) out vec4 outHdrColor;
+  ```
+* **Sky handling:** Fragments with `depth >= 0.999999` are sky pixels.
 
-All AI-generated shaders should utilize these standardized mathematical recipes:
+---
 
-### Recipe A: World Position Reconstruction from Depth
+### 3.3 Volumetric Fog Pass (`volumetric_fog.frag`)
+* **Vertex Shader:** `shaders/common/fullscreen.vert`
+* **Fragment Shader:** `shaders/deferred/volumetric_fog.frag`
+* **Framebuffer:** HDR FBO. Blend mode: `GL_ONE, GL_ONE` (additive). Depth test disabled.
+* **Samplers:**
+  ```glsl
+  layout(binding = 3) uniform sampler2D u_Depth;
+  layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
+  ```
+* **Inputs & Outputs:**
+  ```glsl
+  layout(location = 0) in vec2 v_Uv;
+  layout(location = 0) out vec4 outVolumetricScattering;
+  ```
+
+---
+
+### 3.4 Water & Translucency Pass (`water_surface.frag`)
+* **Execution:** Executed during translucent terrain rasterization or as a surface pass.
+* **Samplers:**
+  ```glsl
+  layout(binding = 0) uniform sampler2D u_OpaqueSceneColor; // Resolved lit opaque terrain
+  layout(binding = 1) uniform sampler2D u_SceneDepth;       // Opaque depth buffer
+  layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap; // Cascaded shadow map
+  ```
+* **Inputs & Outputs:**
+  ```glsl
+  layout(location = 0) in vec3 v_WorldPos;
+  layout(location = 1) in vec2 v_TexCoord;
+  layout(location = 2) in vec2 v_LightCoord;
+  layout(location = 0) out vec4 outHdrColor;
+  ```
+
+---
+
+### 3.5 Post-Process & Tonemapping Pass (`tonemap_bloom.frag`)
+* **Vertex Shader:** `shaders/common/fullscreen.vert`
+* **Fragment Shader:** `shaders/post/tonemap_bloom.frag`
+* **Framebuffer:** Minecraft main target (`mcTarget.frameBufferId`). Viewport = window dimensions.
+* **Samplers:**
+  ```glsl
+  layout(binding = 0) uniform sampler2D u_HdrColorTexture; // Input HDR color from deferred & fog passes
+  ```
+* **Inputs & Outputs:**
+  ```glsl
+  layout(location = 0) in vec2 v_Uv;
+  layout(location = 0) out vec4 outSrgbColor;
+  ```
+
+---
+
+## 4. Mathematical Helper Functions
+
+### 4.1 World Position Reconstruction from Depth
+Transforms normalized screen UV $[0, 1]$ and hardware depth $[0, 1]$ back to camera-relative world coordinates:
 ```glsl
 vec3 reconstructWorldPos(vec2 uv, float depth) {
     vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
@@ -114,8 +187,8 @@ vec3 reconstructWorldPos(vec2 uv, float depth) {
 }
 ```
 
-### Recipe B: Interleaved Gradient Noise (IGN)
-Used for temporal jittering of raymarching and PCF shadows:
+### 4.2 Interleaved Gradient Noise (IGN)
+Generates high-frequency spatial-temporal noise for dithering and jitter:
 ```glsl
 float interleavedGradientNoise(vec2 pixelCoord) {
     vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
@@ -124,215 +197,164 @@ float interleavedGradientNoise(vec2 pixelCoord) {
 }
 ```
 
-### Recipe C: Cook-Torrance GGX Microfacet BRDF
+### 4.3 Cascaded Shadow Map Coordinate Selection
+Selects shadow cascade index based on view distance and projects sample into shadow atlas coordinates:
 ```glsl
-float distributionGGX(vec3 N, vec3 H, float roughness) {
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float NdotH = max(dot(N, H), 0.0);
-    float NdotH2 = NdotH * NdotH;
-    float denom = (NdotH2 * (a2 - 1.0) + 1.0);
-    return a2 / (3.14159265359 * denom * denom + 0.00001);
+int selectCascade(float viewDist) {
+    if (viewDist < u_CascadeSplits.x) return 0;
+    if (viewDist < u_CascadeSplits.y) return 1;
+    return 2;
 }
 
-float geometrySchlickGGX(float NdotV, float roughness) {
-    float r = (roughness + 1.0);
-    float k = (r * r) / 8.0;
-    return NdotV / (NdotV * (1.0 - k) + k);
-}
-
-vec3 fresnelSchlick(float cosTheta, vec3 F0) {
-    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+vec3 getShadowCoords(vec3 worldPos, int cascadeIdx) {
+    vec4 shadowClip = u_CascadeViewProj[cascadeIdx] * vec4(worldPos, 1.0);
+    vec3 shadowNdc = shadowClip.xyz / shadowClip.w;
+    return shadowNdc * 0.5 + 0.5;
 }
 ```
 
-### Recipe D: ACES Filmic Tone Mapping Curve
+### 4.4 Fullscreen Triangle Generation (`fullscreen.vert`)
+Generates a clip-space triangle covering the full viewport using 3 vertices without vertex buffer objects:
 ```glsl
-vec3 acesFilm(vec3 x) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
-    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+#version 460 core
+layout(location = 0) out vec2 v_Uv;
+
+void main() {
+    v_Uv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(v_Uv * 2.0 - 1.0, 0.0, 1.0);
 }
 ```
 
 ---
 
-## 5. Master Prompts for Gemini AI on the Web
+## 5. File Layout & Resource Locations
 
-Copy and paste the prompts below into Gemini AI on the web to generate individual shader stages.
+In `nvidium-shader-pipeline`:
+
+| Shader Stage | File Path in Project |
+|---|---|
+| Fullscreen Vertex | `src/main/resources/assets/nvidium_shaders/shaders/common/fullscreen.vert` |
+| Deferred Lighting | `src/main/resources/assets/nvidium_shaders/shaders/deferred/deferred_lighting.frag` |
+| Volumetric Fog | `src/main/resources/assets/nvidium_shaders/shaders/deferred/volumetric_fog.frag` |
+| GTAO Compute | `src/main/resources/assets/nvidium_shaders/shaders/deferred/gtao.comp` |
+| Water Vertex | `src/main/resources/assets/nvidium_shaders/shaders/water/water_surface.vert` |
+| Water Fragment | `src/main/resources/assets/nvidium_shaders/shaders/water/water_surface.frag` |
+| Post-Process / Bloom | `src/main/resources/assets/nvidium_shaders/shaders/post/tonemap_bloom.frag` |
+| G-Buffer Terrain | `src/main/resources/assets/nvidium_shaders/shaders/gbuffer/terrain_gbuffer.frag` |
 
 ---
 
-### PROMPT 1: Ultra-Realistic Physical Water Shader (`water_surface.frag`)
-```markdown
-You are a senior graphics programmer specializing in modern Minecraft and real-time PBR water rendering.
-Generate a complete, production-grade GLSL 4.60 fragment shader for "water_surface.frag" conforming to the Nvidium Shader Pipeline (NSP).
+## 6. Generator Prompts for LLMs
 
-STRICT CONSTRAINTS:
-1. Version: #version 460 core.
-2. Uniforms: Use the exact SceneUniforms block on (std140, binding = 3).
-3. Samplers:
-   - layout(binding = 0) uniform sampler2D u_OpaqueSceneColor; (Lit opaque terrain color)
-   - layout(binding = 1) uniform sampler2D u_SceneDepth;       (Opaque terrain depth)
-   - layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap; (Cascaded shadow map)
-4. Inputs:
-   - layout(location = 0) in vec3 v_WorldPos;
-   - layout(location = 1) in vec2 v_TexCoord;
-   - layout(location = 2) in vec2 v_LightCoord;
-5. Output:
-   - layout(location = 0) out vec4 outHdrColor;
+Use the prompts below to generate specific shaders. Each prompt contains only the interface specification, uniform layout, and functional requirements.
 
-REQUIRED WATER FEATURES:
-1. Multi-Octave Gerstner Waves:
-   - Calculate animated surface normal using a bank of at least 6 directional Gerstner waves driven by u_Time.
-   - Steepness, frequency, and wave vectors must produce believable organic ocean swell and fine ripples.
-2. Depth-Based Beer-Lambert Optical Absorption:
-   - Sample u_SceneDepth under the water pixel to determine water column depth: deltaDepth = distance(floor) - distance(surface).
-   - Apply wavelength-dependent extinction exp(-sigma * deltaDepth) where red light absorbs quickly and cyan/blue penetrates deep.
-   - In-scatter deep ocean ambient color for deep water.
-3. Shoreline Contact Foam:
-   - Detect shallow boundaries near blocks using smoothstep on water depth.
-   - Modulate with animated noise to create subtle breaking foam along beaches and cliffs.
-4. Screen-Space Reflections (SSR):
-   - March reflected view ray R = reflect(-V, N) in screen space across u_SceneDepth.
-   - If ray intersects geometry within tolerance, sample u_OpaqueSceneColor.
-   - Fall back to realistic atmospheric sky gradient if SSR leaves the screen.
-5. Schlick Fresnel & Sun Specular Glitter:
-   - Water IOR = 1.333 (F0 = 0.02).
-   - Evaluate Cook-Torrance GGX specular highlight from u_SunDirection with sharp highlight and shadow lookup.
-6. Refraction Distortion:
-   - Distort background seabed UVs using the perturbed wave normal, scaled by water depth to avoid refracting foreground objects.
+---
 
-Write the entire shader in a single clean GLSL code block without placeholders or omissions.
+### Prompt: Deferred Lighting Shader (`deferred_lighting.frag`)
+```
+Generate a complete GLSL 4.60 fragment shader for "deferred_lighting.frag".
+
+Interface:
+- #version 460 core
+- Uniform Buffer: layout(std140, binding = 3) uniform SceneUniforms (View, Proj, InvViewProj, CascadeViewProj[3], CascadeSplits, SunDirection, SunColor, AmbientColor, CameraPos, ScreenSize, Time, FrameIndex, FogStart, FogEnd, FogColor)
+- Samplers:
+  - layout(binding = 0) uniform sampler2D u_AlbedoRoughness;
+  - layout(binding = 1) uniform sampler2D u_NormalMetallic;
+  - layout(binding = 2) uniform sampler2D u_LightEmission;
+  - layout(binding = 3) uniform sampler2D u_Depth;
+  - layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
+- Input: layout(location = 0) in vec2 v_Uv;
+- Output: layout(location = 0) out vec4 outHdrColor;
+
+Functional Requirements:
+1. Reconstruct world position from u_Depth and u_InvViewProjMatrix.
+2. If depth >= 0.999999, output atmospheric sky gradient.
+3. Fallback: if length(lightEmission.rg) < 0.001 and length(normalMetallic.xyz) < 0.01, output albedo directly.
+4. If normal is zero, compute geometric normal from dFdx(worldPos) and dFdy(worldPos); otherwise decode normal from [0, 1] to [-1, 1].
+5. Evaluate direct sunlight using Cook-Torrance GGX (D = GGX, G = Smith, F = Schlick).
+6. Sample u_ShadowMap across the appropriate cascade (u_CascadeSplits: x=16m, y=64m, z=256m) with PCF filtering.
+7. Compute torch lighting from lightEmission.r with inverse-square falloff and lightEmission.b for material emission.
+8. Apply ambient irradiance scaled by lightEmission.g (sky light).
+9. Blend with distance fog (u_FogStart, u_FogEnd, u_FogColor).
+10. Output linear HDR color in outHdrColor.
 ```
 
 ---
 
-### PROMPT 2: High-End Deferred PBR Lighting Shader (`deferred_lighting.frag`)
-```markdown
-You are a senior graphics programmer specializing in deferred rendering pipelines and physically-based lighting (PBR).
-Generate a complete, production-ready GLSL 4.60 fragment shader for "deferred_lighting.frag" conforming to the Nvidium Shader Pipeline (NSP).
+### Prompt: Volumetric Fog Shader (`volumetric_fog.frag`)
+```
+Generate a complete GLSL 4.60 fragment shader for "volumetric_fog.frag".
 
-STRICT CONSTRAINTS:
-1. Version: #version 460 core.
-2. Uniforms: Use the exact SceneUniforms block on (std140, binding = 3).
-3. G-Buffer Samplers:
-   - layout(binding = 0) uniform sampler2D u_AlbedoRoughness; (RGB: Albedo, A: Roughness)
-   - layout(binding = 1) uniform sampler2D u_NormalMetallic;  (RGB: Encoded Normal, A: Metalness)
-   - layout(binding = 2) uniform sampler2D u_LightEmission;   (R: Block Light, G: Sky Light, B: Emission)
-   - layout(binding = 3) uniform sampler2D u_Depth;           (Hardware Depth)
-   - layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap; (3-Cascade Shadow Map Array)
-4. Input & Output:
-   - layout(location = 0) in vec2 v_Uv;
-   - layout(location = 0) out vec4 outHdrColor;
+Interface:
+- #version 460 core
+- Uniform Buffer: layout(std140, binding = 3) uniform SceneUniforms (View, Proj, InvViewProj, CascadeViewProj[3], CascadeSplits, SunDirection, SunColor, AmbientColor, CameraPos, ScreenSize, Time, FrameIndex)
+- Samplers:
+  - layout(binding = 3) uniform sampler2D u_Depth;
+  - layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
+- Input: layout(location = 0) in vec2 v_Uv;
+- Output: layout(location = 0) out vec4 outVolumetricScattering;
 
-REQUIRED LIGHTING FEATURES:
-1. Depth Unprojection & Sky Background:
-   - If depth >= 0.999999, render realistic atmospheric sky with sun disk and Mie aureole.
-2. Robust Pre-Lit Fallback:
-   - If length(lightEmission.rg) < 0.001 && length(normalMetallic.xyz) < 0.01, output albedo directly so unhooked/vanilla blocks are never black.
-   - If normal map is missing, derive geometric normal via normalize(cross(dFdx(worldPos), dFdy(worldPos))).
-3. Direct Sunlight (Cook-Torrance GGX + Cascaded PCF Shadows):
-   - Sample cascaded shadow map using 16-tap Poisson disk with Interleaved Gradient Noise jittering.
-   - Select cascade automatically based on view distance and splits (u_CascadeSplits: 16m, 64m, 256m).
-   - Evaluate D (GGX), G (Smith), and F (Schlick) specular terms plus energy-conserving Lambertian diffuse.
-4. Physical 1/r² Dynamic Colored Torchlight:
-   - Convert normalized Minecraft block light level [0..1] to physical distance.
-   - Physical inverse-square falloff with smooth windowing at distance boundary.
-   - Blackbody spectral temperature shift (~1900K deep ember to 2800K bright flame) with organic flame flicker.
-5. Atmospheric Sky Ambient & Micro-Crevice AO:
-   - Screen-space depth-horizon crevice AO calculation.
-   - Hemispheric irradiance gradient (warm ground bounce to cool blue sky zenith).
-6. LabPBR Emissive Lighting:
-   - Emissive blocks (lava, glowstone, lanterns) illuminate their surroundings and glow.
-7. Smooth Distance Fog:
-   - Exponential atmospheric haze blending smoothly into horizon sky color.
-
-Write the entire shader in a single clean GLSL code block without placeholders or omissions.
+Functional Requirements:
+1. Reconstruct ray end world position from u_Depth. Clamp march distance to 192 meters.
+2. Apply ray start jitter using Interleaved Gradient Noise driven by u_FrameIndex.
+3. Raymarch from camera position to endpoint in 32 uniform steps.
+4. At each step, test shadow visibility against u_ShadowMap using the corresponding cascade.
+5. Evaluate phase function (Henyey-Greenstein, g = 0.76) for angle between ray direction and u_SunDirection.
+6. Apply exponential height falloff based on world position Y.
+7. Accumulate in-scattered radiance and integrate Beer-Lambert transmittance.
+8. Output accumulated scattering in outVolumetricScattering (will be blended with GL_ONE, GL_ONE).
 ```
 
 ---
 
-### PROMPT 3: Cinematic Raymarched Volumetric God Rays (`volumetric_fog.frag`)
-```markdown
-You are a senior rendering engineer specializing in participating media and atmospheric scattering.
-Generate a complete, production-grade GLSL 4.60 fragment shader for "volumetric_fog.frag" conforming to the Nvidium Shader Pipeline (NSP).
+### Prompt: Water Surface Shader (`water_surface.frag`)
+```
+Generate a complete GLSL 4.60 fragment shader for "water_surface.frag".
 
-STRICT CONSTRAINTS:
-1. Version: #version 460 core.
-2. Uniforms: Use the exact SceneUniforms block on (std140, binding = 3).
-3. Samplers:
-   - layout(binding = 3) uniform sampler2D u_Depth;
-   - layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
-4. Input & Output:
-   - layout(location = 0) in vec2 v_Uv;
-   - layout(location = 0) out vec4 outVolumetricScattering; (Blended additively GL_ONE, GL_ONE)
+Interface:
+- #version 460 core
+- Uniform Buffer: layout(std140, binding = 3) uniform SceneUniforms (View, Proj, InvViewProj, CascadeViewProj[3], CascadeSplits, SunDirection, SunColor, AmbientColor, CameraPos, ScreenSize, Time, FrameIndex, FogStart, FogEnd, FogColor)
+- Samplers:
+  - layout(binding = 0) uniform sampler2D u_OpaqueSceneColor;
+  - layout(binding = 1) uniform sampler2D u_SceneDepth;
+  - layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
+- Inputs:
+  - layout(location = 0) in vec3 v_WorldPos;
+  - layout(location = 1) in vec2 v_TexCoord;
+  - layout(location = 2) in vec2 v_LightCoord;
+- Output: layout(location = 0) out vec4 outHdrColor;
 
-REQUIRED ALGORITHM:
-1. Ray Construction:
-   - Unproject screen UV and depth to find world endpoint.
-   - Clamp maximum raymarching distance to 192 meters.
-2. Temporal Noise Jittering:
-   - Offset initial ray step using Interleaved Gradient Noise (u_FrameIndex) to eliminate visible ray slicing bands.
-3. 32-Step Raymarching:
-   - March along view ray from camera to endpoint in 32 uniform steps.
-   - Test each sample position against the Cascaded Shadow Map (CSM) to determine sunlight occlusion.
-4. Henyey-Greenstein Phase Function:
-   - Evaluate forward aerosol Mie scattering with asymmetry parameter g = 0.76.
-5. Height-Based Density Falloff:
-   - Atmospheric density decays exponentially with height above sea level (Y=63).
-6. Beer-Lambert Transmittance:
-   - Accumulate in-scattered radiance attenuated by transmittance extinction.
-
-Write the entire shader in a single clean GLSL code block without placeholders or omissions.
+Functional Requirements:
+1. Compute animated surface normal using Gerstner wave formulation driven by u_Time and world position XZ.
+2. Unproject seabed depth under the water fragment from u_SceneDepth. Compute water column depth: deltaDepth = floorDistance - surfaceDistance.
+3. Distort screen UV by wave normal scaled by deltaDepth to sample u_OpaqueSceneColor for refraction.
+4. Apply Beer-Lambert absorption: exp(-sigmaExtinction * deltaDepth) to refracted color.
+5. March reflected ray R = reflect(-V, N) in screen space across u_SceneDepth to compute Screen-Space Reflections (SSR), falling back to sky gradient.
+6. Evaluate Fresnel reflectance (F0 = 0.02) and blend refraction and reflection.
+7. Add Cook-Torrance GGX specular highlight from u_SunDirection with shadow lookup from u_ShadowMap.
+8. Blend shore/crest foam and distance fog. Output linear HDR color in outHdrColor.
 ```
 
 ---
 
-### PROMPT 4: Dual-Kawase Bloom & ACES Tonemapping (`tonemap_bloom.frag`)
-```markdown
-You are a senior graphics programmer specializing in HDR color grading and post-processing.
-Generate a complete, production-ready GLSL 4.60 fragment shader for "tonemap_bloom.frag" conforming to the Nvidium Shader Pipeline (NSP).
-
-STRICT CONSTRAINTS:
-1. Version: #version 460 core.
-2. Uniforms: Use the exact SceneUniforms block on (std140, binding = 3).
-3. Samplers:
-   - layout(binding = 0) uniform sampler2D u_HdrColorTexture;
-4. Input & Output:
-   - layout(location = 0) in vec2 v_Uv;
-   - layout(location = 0) out vec4 outSrgbColor;
-
-REQUIRED POST-PROCESSING PIPELINE:
-1. Multi-Octave Dual-Kawase / Tent Bloom Pyramid Approximation:
-   - Sample 4 radial octaves (radii 1.5, 3.5, 7.5, 14.0 texels) with 8 sample directions per octave.
-   - Extract HDR highlights using soft-knee thresholding (threshold = 1.1, knee = 0.5).
-   - Composite bloom additively with controllable intensity.
-2. Exposure Adjustment:
-   - Apply exposure multiplier (e.g. 1.05).
-3. ACES Filmic Tone Mapping:
-   - Apply Narkowicz 2015 ACES filmic reproduction curve mapping HDR [0, inf) to display [0, 1].
-4. Color Vibrance & Lift:
-   - Subtle contrast lift and luminance-preserving saturation enhancement.
-5. Gamma Correction:
-   - Convert linear color to standard sRGB gamma (pow(color, 1.0 / 2.2)).
-
-Write the entire shader in a single clean GLSL code block without placeholders or omissions.
+### Prompt: Post-Processing & Tonemapping Shader (`tonemap_bloom.frag`)
 ```
+Generate a complete GLSL 4.60 fragment shader for "tonemap_bloom.frag".
 
----
+Interface:
+- #version 460 core
+- Uniform Buffer: layout(std140, binding = 3) uniform SceneUniforms (ScreenSize)
+- Samplers:
+  - layout(binding = 0) uniform sampler2D u_HdrColorTexture;
+- Input: layout(location = 0) in vec2 v_Uv;
+- Output: layout(location = 0) out vec4 outSrgbColor;
 
-## 6. How to Deploy Generated Shaders
-
-Once Gemini AI on the web generates any shader:
-1. Save the generated shader file into the respective resource folder:
-   - `deferred_lighting.frag` $\rightarrow$ `src/main/resources/assets/nvidium_shaders/shaders/deferred/`
-   - `water_surface.frag` $\rightarrow$ `src/main/resources/assets/nvidium_shaders/shaders/water/`
-   - `volumetric_fog.frag` $\rightarrow$ `src/main/resources/assets/nvidium_shaders/shaders/deferred/`
-   - `tonemap_bloom.frag` $\rightarrow$ `src/main/resources/assets/nvidium_shaders/shaders/post/`
-   - `gtao.comp` $\rightarrow$ `src/main/resources/assets/nvidium_shaders/shaders/deferred/`
-2. Run `gradlew build` in `nvidium-shader-pipeline`.
-3. Copy the resulting JAR into your Prism Launcher `mods/` directory.
+Functional Requirements:
+1. Sample u_HdrColorTexture at v_Uv.
+2. Extract bright highlights exceeding threshold 1.1 with smooth knee 0.5.
+3. Compute multi-octave radial blur (radii 1.5, 3.5, 7.5, 14.0 texels) to approximate bloom and add to HDR color.
+4. Apply exposure scaling.
+5. Apply ACES Filmic tonemapping curve: clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0).
+6. Convert output to sRGB gamma: pow(color, vec3(1.0 / 2.2)).
+7. Output RGBA in outSrgbColor.
+```
