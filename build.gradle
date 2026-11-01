@@ -60,6 +60,9 @@ processResources {
 dependencies {
     // Sodium
     implementation "maven.modrinth:sodium:mc1.21.1-0.6.13-neoforge"
+
+    // Nvidium API integration
+    compileOnly files("../neo-nvidium-dev/build/libs/nvidium-0.3.0.jar")
 }
 
 tasks.withType(JavaCompile).configureEach {
