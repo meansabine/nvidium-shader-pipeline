@@ -1,100 +1,169 @@
 package net.nvidium.shaders.pipeline.gl;
 
-import net.minecraft.client.Minecraft;
-import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.packs.resources.Resource;
 import net.nvidium.shaders.NvidiumShaderPipeline;
-import org.lwjgl.opengl.GL11C;
+import net.nvidium.shaders.pack.ShaderPack;
+import net.nvidium.shaders.pack.ShaderPackManager;
+import net.nvidium.shaders.pack.ShaderSourceLoader;
 import org.lwjgl.opengl.GL20C;
+import org.lwjgl.opengl.GL43C;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * Modern OpenGL shader program supporting standard pipeline stages
- * as well as NVIDIA Mesh & Task shaders (GL_NV_mesh_shader).
- * Includes recursive pre-processing of #include and #import directives.
+ * OpenGL shader program wrapper for fullscreen & compute passes with pack-aware loading
+ * and automatic built-in stage fallback on compilation errors.
  */
 public class ShaderProgram {
-    public static final int GL_MESH_SHADER_NV = 0x864E;
-    public static final int GL_TASK_SHADER_NV = 0x864F;
+    private final int programId;
+    private final String debugName;
+    private final Map<String, Integer> uniformLocations = new HashMap<>();
 
-    private int programId;
-    private final Map<Integer, Integer> attachedShaders = new HashMap<>();
-    private final String name;
-
-    public ShaderProgram(String name) {
-        this.name = name;
-        this.programId = GL20C.glCreateProgram();
+    private ShaderProgram(int programId, String debugName) {
+        this.programId = programId;
+        this.debugName = debugName;
     }
 
-    public ShaderProgram attachStage(int stageType, ResourceLocation shaderLocation) {
-        String source = loadShaderSource(shaderLocation);
-        if (source == null) {
-            throw new RuntimeException("Failed to read shader file: " + shaderLocation);
+    /**
+     * Compiles a fullscreen pass shader (common fullscreen.vert + stage fragment shader)
+     * from the active {@link ShaderPack}, falling back to the built-in stage if custom
+     * compilation fails.
+     */
+    public static ShaderProgram createFullscreenStage(ShaderPack pack, String stageKey) {
+        String vertSrc = ShaderSourceLoader.loadStageSource(pack, "fullscreen_vert", false);
+        try {
+            String fragSrc = ShaderSourceLoader.loadStageSource(pack, stageKey, false);
+            return compileVertFrag(stageKey, vertSrc, fragSrc);
+        } catch (Exception e) {
+            ShaderPackManager.get().recordError("Fullscreen stage '" + stageKey + "' failed", e.getMessage());
+            if (pack != null && !pack.isBuiltin()) {
+                NvidiumShaderPipeline.LOGGER.warn("Falling back to built-in stage '{}' after compilation error in pack '{}'",
+                        stageKey, pack.getName());
+                String builtinVert = ShaderSourceLoader.loadBuiltinStageSource("fullscreen_vert", false);
+                String builtinFrag = ShaderSourceLoader.loadBuiltinStageSource(stageKey, false);
+                return compileVertFrag(stageKey + " (builtin-fallback)", builtinVert, builtinFrag);
+            }
+            throw e;
         }
-
-        int shaderId = GL20C.glCreateShader(stageType);
-        GL20C.glShaderSource(shaderId, source);
-        GL20C.glCompileShader(shaderId);
-
-        int compiled = GL20C.glGetShaderi(shaderId, GL20C.GL_COMPILE_STATUS);
-        if (compiled == GL11C.GL_FALSE) {
-            String log = GL20C.glGetShaderInfoLog(shaderId);
-            GL20C.glDeleteShader(shaderId);
-            throw new RuntimeException("Shader compilation failed for [" + name + "] (" + shaderLocation + "):\n" + log);
-        }
-
-        GL20C.glAttachShader(this.programId, shaderId);
-        attachedShaders.put(stageType, shaderId);
-        return this;
     }
 
-    public ShaderProgram link() {
-        GL20C.glLinkProgram(programId);
-        int linked = GL20C.glGetProgrami(programId, GL20C.GL_LINK_STATUS);
-        if (linked == GL11C.GL_FALSE) {
-            String log = GL20C.glGetProgramInfoLog(programId);
-            throw new RuntimeException("Shader link failed for [" + name + "]:\n" + log);
-        }
+    public static ShaderProgram compileVertFrag(String debugName, String vertSource, String fragSource) {
+        int program = GL20C.glCreateProgram();
+        int vert = 0;
+        int frag = 0;
+        try {
+            vert = compileShader(GL20C.GL_VERTEX_SHADER, vertSource, debugName + ".vert");
+            frag = compileShader(GL20C.GL_FRAGMENT_SHADER, fragSource, debugName + ".frag");
 
-        // Clean up attached shader objects once linked
-        for (int shaderId : attachedShaders.values()) {
-            GL20C.glDetachShader(programId, shaderId);
-            GL20C.glDeleteShader(shaderId);
+            GL20C.glAttachShader(program, vert);
+            GL20C.glAttachShader(program, frag);
+            GL20C.glLinkProgram(program);
+
+            if (GL20C.glGetProgrami(program, GL20C.GL_LINK_STATUS) == GL20C.GL_FALSE) {
+                String log = GL20C.glGetProgramInfoLog(program);
+                throw new RuntimeException("Shader link failure in [" + debugName + "]:\n" + log);
+            }
+            return new ShaderProgram(program, debugName);
+        } catch (RuntimeException ex) {
+            if (program != 0) {
+                GL20C.glDeleteProgram(program);
+            }
+            throw ex;
+        } finally {
+            if (vert != 0) {
+                GL20C.glDetachShader(program, vert);
+                GL20C.glDeleteShader(vert);
+            }
+            if (frag != 0) {
+                GL20C.glDetachShader(program, frag);
+                GL20C.glDeleteShader(frag);
+            }
         }
-        attachedShaders.clear();
-        return this;
+    }
+
+    public static ShaderProgram createCompute(String debugName, String compSource) {
+        int program = GL20C.glCreateProgram();
+        int comp = 0;
+        try {
+            comp = compileShader(GL43C.GL_COMPUTE_SHADER, compSource, debugName + ".comp");
+            GL20C.glAttachShader(program, comp);
+            GL20C.glLinkProgram(program);
+
+            if (GL20C.glGetProgrami(program, GL20C.GL_LINK_STATUS) == GL20C.GL_FALSE) {
+                String log = GL20C.glGetProgramInfoLog(program);
+                throw new RuntimeException("Compute link failure in [" + debugName + "]:\n" + log);
+            }
+            return new ShaderProgram(program, debugName);
+        } catch (RuntimeException ex) {
+            if (program != 0) {
+                GL20C.glDeleteProgram(program);
+            }
+            throw ex;
+        } finally {
+            if (comp != 0) {
+                GL20C.glDetachShader(program, comp);
+                GL20C.glDeleteShader(comp);
+            }
+        }
+    }
+
+    private static int compileShader(int type, String source, String label) {
+        int shader = GL20C.glCreateShader(type);
+        GL20C.glShaderSource(shader, source);
+        GL20C.glCompileShader(shader);
+
+        if (GL20C.glGetShaderi(shader, GL20C.GL_COMPILE_STATUS) == GL20C.GL_FALSE) {
+            String log = GL20C.glGetShaderInfoLog(shader);
+            GL20C.glDeleteShader(shader);
+            throw new RuntimeException("GLSL compile error in [" + label + "]:\n" + log);
+        }
+        return shader;
     }
 
     public void bind() {
         GL20C.glUseProgram(programId);
     }
 
-    public static void unbind() {
+    public void unbind() {
         GL20C.glUseProgram(0);
     }
 
-    public int getUniformLocation(String uniformName) {
-        return GL20C.glGetUniformLocation(programId, uniformName);
+    public int getUniformLocation(String name) {
+        return uniformLocations.computeIfAbsent(name, n -> GL20C.glGetUniformLocation(programId, n));
     }
 
-    public void setUniform1i(String name, int value) {
+    public void setUniform1i(String name, int val) {
         int loc = getUniformLocation(name);
-        if (loc != -1) GL20C.glUniform1i(loc, value);
+        if (loc != -1) {
+            GL20C.glUniform1i(loc, val);
+        }
     }
 
-    public void setUniform1f(String name, float value) {
+    public void setUniform1f(String name, float val) {
         int loc = getUniformLocation(name);
-        if (loc != -1) GL20C.glUniform1f(loc, value);
+        if (loc != -1) {
+            GL20C.glUniform1f(loc, val);
+        }
     }
 
-    public void destroy() {
-        if (programId != 0) {
-            GL20C.glDeleteProgram(programId);
-            programId = 0;
+    public void setUniform2f(String name, float x, float y) {
+        int loc = getUniformLocation(name);
+        if (loc != -1) {
+            GL20C.glUniform2f(loc, x, y);
+        }
+    }
+
+    public void setUniform3f(String name, float x, float y, float z) {
+        int loc = getUniformLocation(name);
+        if (loc != -1) {
+            GL20C.glUniform3f(loc, x, y, z);
+        }
+    }
+
+    public void setUniform4f(String name, float x, float y, float z, float w) {
+        int loc = getUniformLocation(name);
+        if (loc != -1) {
+            GL20C.glUniform4f(loc, x, y, z, w);
         }
     }
 
@@ -102,104 +171,13 @@ public class ShaderProgram {
         return programId;
     }
 
-    public String getName() {
-        return name;
+    public String getDebugName() {
+        return debugName;
     }
 
-    public static String loadShaderSource(ResourceLocation location) {
-        return loadShaderSource(location, new HashSet<>());
-    }
-
-    private static String loadShaderSource(ResourceLocation location, Set<ResourceLocation> visited) {
-        if (!visited.add(location)) {
-            return "// Cycle omitted: " + location + "\n";
+    public void delete() {
+        if (programId != 0) {
+            GL20C.glDeleteProgram(programId);
         }
-
-        try {
-            Optional<Resource> res = resolveResource(location);
-            if (res.isPresent()) {
-                StringBuilder builder = new StringBuilder();
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(res.get().open(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        String trimmed = line.trim();
-                        if (trimmed.startsWith("#include") || trimmed.startsWith("#import")) {
-                            int start = trimmed.indexOf('<');
-                            int end = trimmed.indexOf('>');
-                            if (start == -1 || end == -1) {
-                                start = trimmed.indexOf('"');
-                                end = trimmed.lastIndexOf('"');
-                            }
-                            if (start != -1 && end != -1 && end > start) {
-                                String includeTarget = trimmed.substring(start + 1, end).trim();
-                                ResourceLocation incLoc = parseIncludeLocation(location, includeTarget);
-                                String includedContent = loadShaderSource(incLoc, visited);
-                                if (includedContent != null) {
-                                    builder.append("// --- Begin Included: ").append(includeTarget).append(" ---\n");
-                                    builder.append(includedContent).append("\n");
-                                    builder.append("// --- End Included: ").append(includeTarget).append(" ---\n");
-                                    continue;
-                                } else {
-                                    NvidiumShaderPipeline.LOGGER.warn("Failed to resolve shader include: {}", includeTarget);
-                                }
-                            }
-                        }
-                        builder.append(line).append("\n");
-                    }
-                }
-                return builder.toString();
-            } else {
-                NvidiumShaderPipeline.LOGGER.error("Shader resource not found: {}", location);
-            }
-        } catch (Exception e) {
-            NvidiumShaderPipeline.LOGGER.error("Error reading shader: {}", location, e);
-        }
-        return null;
-    }
-
-    private static Optional<Resource> resolveResource(ResourceLocation loc) {
-        var rm = Minecraft.getInstance().getResourceManager();
-        var direct = rm.getResource(loc);
-        if (direct.isPresent()) return direct;
-
-        // Try prefixing "shaders/" if omitted
-        if (!loc.getPath().startsWith("shaders/")) {
-            var withShaders = rm.getResource(ResourceLocation.fromNamespaceAndPath(loc.getNamespace(), "shaders/" + loc.getPath()));
-            if (withShaders.isPresent()) return withShaders;
-        }
-        return Optional.empty();
-    }
-
-    private static ResourceLocation parseIncludeLocation(ResourceLocation parent, String includePath) {
-        String namespace = parent.getNamespace();
-        String path = includePath;
-        if (includePath.contains(":")) {
-            String[] parts = includePath.split(":", 2);
-            namespace = parts[0];
-            path = parts[1];
-        } else {
-            String parentPath = parent.getPath();
-            int slash = parentPath.lastIndexOf('/');
-            String dir = slash != -1 ? parentPath.substring(0, slash + 1) : "";
-            path = dir + path;
-        }
-        path = normalizePath(path);
-        return ResourceLocation.fromNamespaceAndPath(namespace, path);
-    }
-
-    private static String normalizePath(String path) {
-        String[] parts = path.split("/");
-        List<String> list = new ArrayList<>();
-        for (String p : parts) {
-            if (p.isEmpty() || p.equals(".")) continue;
-            if (p.equals("..")) {
-                if (!list.isEmpty()) {
-                    list.remove(list.size() - 1);
-                }
-            } else {
-                list.add(p);
-            }
-        }
-        return String.join("/", list);
     }
 }

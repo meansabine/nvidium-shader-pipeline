@@ -1,27 +1,102 @@
 package net.nvidium.shaders.pipeline.passes;
 
-import net.minecraft.resources.ResourceLocation;
-import net.nvidium.shaders.NvidiumShaderPipeline;
-import net.nvidium.shaders.pipeline.PipelineManager;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.GlStateManager;
+import net.minecraft.client.Minecraft;
+import net.nvidium.shaders.config.PipelineConfig;
+import net.nvidium.shaders.pack.ShaderPack;
+import net.nvidium.shaders.pack.ShaderPackManager;
 import net.nvidium.shaders.pipeline.gl.FullscreenQuad;
 import net.nvidium.shaders.pipeline.gl.ShaderProgram;
+import net.nvidium.shaders.pipeline.shadow.CascadedShadowMap;
+import net.nvidium.shaders.pipeline.targets.HdrTargets;
+import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
+import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL13C;
-import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL45C;
 
 /**
- * Volumetric Fog & Light Shaft Pass.
- * Raymarches the Sun/Moon Cascaded Shadow Map from camera to surface depth,
- * blending in-scattered light shafts additively into the HDR color buffer.
+ * Raymarched volumetric light-shafts (sun godrays / moonbeams / underwater shafts) and
+ * exponential height fog pass. Writes RGBA16F (`rgb = inscatter, a = transmittance`)
+ * into {@link HdrTargets#getFogFbo()}.
  */
 public class VolumetricFogPass implements IShaderPass {
+    private final CascadedShadowMap csm;
+    private final HdrTargets hdrTargets;
+    private final SceneUniforms sceneUniforms;
+    private final PackOptionsUniforms packOptionsUniforms;
+
+    private ShaderProgram fogProgram;
     private boolean enabled = true;
-    private ShaderProgram fogShader;
+
+    public VolumetricFogPass(
+            CascadedShadowMap csm,
+            HdrTargets hdrTargets,
+            SceneUniforms sceneUniforms,
+            PackOptionsUniforms packOptionsUniforms) {
+        this.csm = csm;
+        this.hdrTargets = hdrTargets;
+        this.sceneUniforms = sceneUniforms;
+        this.packOptionsUniforms = packOptionsUniforms;
+    }
 
     @Override
-    public String getId() {
-        return "volumetric_fog";
+    public void init() {
+        ShaderPack pack = ShaderPackManager.get().getActivePack();
+        this.fogProgram = ShaderProgram.createFullscreenStage(pack, "fog");
+    }
+
+    @Override
+    public void execute(RenderContext ctx) {
+        if (!enabled || fogProgram == null) return;
+
+        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, hdrTargets.getFogFbo());
+        GL11C.glViewport(0, 0, ctx.getScreenWidth(), ctx.getScreenHeight());
+
+        if (!PipelineConfig.get().volumetricFog) {
+            GL11C.glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            GL11C.glClear(GL11C.GL_COLOR_BUFFER_BIT);
+            return;
+        }
+
+        GL11C.glDisable(GL11C.GL_DEPTH_TEST);
+        GL11C.glDepthMask(false);
+        GL11C.glDisable(GL11C.GL_BLEND);
+
+        sceneUniforms.bindStandard();
+        packOptionsUniforms.bindStandard();
+
+        fogProgram.bind();
+
+        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+        GL45C.glBindTextureUnit(0, mcTarget.getDepthTextureId());
+        csm.bindTextureArray(1);
+
+        FullscreenQuad.render();
+
+        fogProgram.unbind();
+        GL11C.glDepthMask(true);
+        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
+        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+    }
+
+    @Override
+    public void resize(int width, int height) {
+    }
+
+    @Override
+    public void destroy() {
+        if (fogProgram != null) {
+            fogProgram.delete();
+            fogProgram = null;
+        }
+    }
+
+    @Override
+    public String getName() {
+        return "VolumetricFogPass";
     }
 
     @Override
@@ -29,71 +104,7 @@ public class VolumetricFogPass implements IShaderPass {
         return enabled;
     }
 
-    @Override
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
-    }
-
-    @Override
-    public void init(PipelineManager pipeline) {
-        reload();
-    }
-
-    @Override
-    public void execute(PipelineManager pipeline, RenderContext context) {
-        if (!enabled) return;
-
-        DeferredLightingPass lightingPass = (DeferredLightingPass) pipeline.getPass("deferred_lighting");
-        if (lightingPass == null || fogShader == null) return;
-
-        // Render additively onto HDR FBO
-        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, lightingPass.getHdrFbo());
-        GL11C.glViewport(0, 0, pipeline.getWidth(), pipeline.getHeight());
-
-        GL11C.glEnable(GL11C.GL_BLEND);
-        GL11C.glBlendFunc(GL11C.GL_ONE, GL11C.GL_ONE); // Additive blending for scattering
-        GL11C.glDisable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthMask(false);
-
-        fogShader.bind();
-
-        // Bind Depth Texture: Unit 3
-        GL13C.glActiveTexture(GL13C.GL_TEXTURE3);
-        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, pipeline.getGbuffer().getDepthTex());
-        fogShader.setUniform1i("u_Depth", 3);
-
-        // Bind Shadow Map: Unit 4
-        pipeline.getShadowMap().bindTexture(4);
-        fogShader.setUniform1i("u_ShadowMap", 4);
-
-        FullscreenQuad.render();
-        ShaderProgram.unbind();
-
-        GL11C.glDisable(GL11C.GL_BLEND);
-        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, 0);
-    }
-
-    @Override
-    public void resize(int width, int height) {}
-
-    @Override
-    public void reload() {
-        try {
-            if (fogShader != null) fogShader.destroy();
-            fogShader = new ShaderProgram("VolumetricFog")
-                    .attachStage(GL20C.GL_VERTEX_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/common/fullscreen.vert"))
-                    .attachStage(GL20C.GL_FRAGMENT_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/deferred/volumetric_fog.frag"))
-                    .link();
-        } catch (Exception e) {
-            NvidiumShaderPipeline.LOGGER.error("Failed to compile VolumetricFog shader", e);
-        }
-    }
-
-    @Override
-    public void destroy() {
-        if (fogShader != null) {
-            fogShader.destroy();
-            fogShader = null;
-        }
     }
 }

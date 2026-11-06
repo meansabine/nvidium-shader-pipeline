@@ -1,26 +1,105 @@
 package net.nvidium.shaders.pipeline.passes;
 
-import net.minecraft.resources.ResourceLocation;
-import net.nvidium.shaders.NvidiumShaderPipeline;
-import net.nvidium.shaders.pipeline.PipelineManager;
-import net.nvidium.shaders.pipeline.gl.ShaderProgram;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.GlStateManager;
+import me.cortex.nvidium.gl.shader.Shader;
+import net.minecraft.client.Minecraft;
+import net.nvidium.shaders.pack.NvidiumShaderPrograms;
+import net.nvidium.shaders.pack.ShaderPack;
+import net.nvidium.shaders.pack.ShaderPackManager;
+import net.nvidium.shaders.pipeline.shadow.CascadedShadowMap;
+import net.nvidium.shaders.pipeline.targets.SceneCopyTargets;
+import net.nvidium.shaders.pipeline.textures.PbrAtlasHooks;
+import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
+import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL13C;
-import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL45C;
 
 /**
- * Water & Translucent Pass.
- * Evaluates Screen-Space Reflections (SSR), depth-based water refraction,
- * and Beer-Lambert physical absorption for oceans and rivers.
+ * Provides Nvidium's mesh-shader translucent pass ({@code translucent/task.glsl + translucent/mesh.glsl + water_surface.frag}),
+ * binding the feedback-loop-free scene color & depth copy textures for physical water refraction,
+ * Beer-Lambert absorption, seabed caustics, SSR, and dielectric stained-glass/ice shading.
  */
 public class WaterTranslucentPass implements IShaderPass {
-    private boolean enabled = false;
-    private ShaderProgram waterShader;
+    private final SceneCopyTargets sceneCopyTargets;
+    private final CascadedShadowMap csm;
+    private final SceneUniforms sceneUniforms;
+    private final PackOptionsUniforms packOptionsUniforms;
+    private final PbrAtlasHooks pbrHooks;
+
+    private Shader customTranslucentShader;
+    private boolean enabled = true;
+
+    public WaterTranslucentPass(
+            SceneCopyTargets sceneCopyTargets,
+            CascadedShadowMap csm,
+            SceneUniforms sceneUniforms,
+            PackOptionsUniforms packOptionsUniforms,
+            PbrAtlasHooks pbrHooks) {
+        this.sceneCopyTargets = sceneCopyTargets;
+        this.csm = csm;
+        this.sceneUniforms = sceneUniforms;
+        this.packOptionsUniforms = packOptionsUniforms;
+        this.pbrHooks = pbrHooks;
+    }
 
     @Override
-    public String getId() {
-        return "water_translucent";
+    public void init() {
+        ShaderPack pack = ShaderPackManager.get().getActivePack();
+        this.customTranslucentShader = NvidiumShaderPrograms.compileTranslucentShader(pack);
+    }
+
+    @Override
+    public void execute(RenderContext ctx) {
+        if (!enabled) return;
+
+        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+
+        // Snapshot opaque + entity + particle color & depth before translucent geometry renders
+        sceneCopyTargets.copyFromFbo(mcTarget.frameBufferId, mcTarget.getDepthTextureId(), true, true, true);
+
+        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, mcTarget.frameBufferId);
+        GL11C.glViewport(0, 0, ctx.getScreenWidth(), ctx.getScreenHeight());
+
+        // Bind UBOs into NVIDIA Unified Memory address slots 3 and 4
+        sceneUniforms.bindUnified();
+        packOptionsUniforms.bindUnified();
+    }
+
+    public void bindTranslucentTextures() {
+        pbrHooks.bindPbrTextures(2, 3);
+        GL45C.glBindTextureUnit(4, sceneCopyTargets.getColorCopyTex());
+        GL45C.glBindTextureUnit(5, sceneCopyTargets.getDepthCopyTex());
+        csm.bindTextureArray(6);
+
+        sceneUniforms.bindUnified();
+        packOptionsUniforms.bindUnified();
+
+        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
+        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+    }
+
+    public Shader getCustomTranslucentShader() {
+        return enabled ? customTranslucentShader : null;
+    }
+
+    @Override
+    public void resize(int width, int height) {
+    }
+
+    @Override
+    public void destroy() {
+        if (customTranslucentShader != null) {
+            customTranslucentShader.delete();
+            customTranslucentShader = null;
+        }
+    }
+
+    @Override
+    public String getName() {
+        return "WaterTranslucentPass";
     }
 
     @Override
@@ -28,78 +107,7 @@ public class WaterTranslucentPass implements IShaderPass {
         return enabled;
     }
 
-    @Override
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
-    }
-
-    @Override
-    public void init(PipelineManager pipeline) {
-        reload();
-    }
-
-    @Override
-    public void execute(PipelineManager pipeline, RenderContext context) {
-        if (!enabled) return;
-
-        DeferredLightingPass lightingPass = (DeferredLightingPass) pipeline.getPass("deferred_lighting");
-        if (lightingPass == null) return;
-
-        // Render into HDR color target with depth testing against G-Buffer depth
-        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, lightingPass.getHdrFbo());
-        GL11C.glViewport(0, 0, pipeline.getWidth(), pipeline.getHeight());
-
-        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
-        GL11C.glEnable(GL11C.GL_BLEND);
-        GL11C.glBlendFunc(GL11C.GL_SRC_ALPHA, GL11C.GL_ONE_MINUS_SRC_ALPHA);
-
-        if (waterShader != null) {
-            waterShader.bind();
-
-            // Bind opaque scene color: Unit 0
-            GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
-            GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, lightingPass.getHdrColorTexture());
-            waterShader.setUniform1i("u_OpaqueSceneColor", 0);
-
-            // Bind depth texture: Unit 1
-            GL13C.glActiveTexture(GL13C.GL_TEXTURE1);
-            GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, pipeline.getGbuffer().getDepthTex());
-            waterShader.setUniform1i("u_SceneDepth", 1);
-
-            // Bind shadow map: Unit 4
-            pipeline.getShadowMap().bindTexture(4);
-            waterShader.setUniform1i("u_ShadowMap", 4);
-
-            // Hook for Nvidium's TranslucentTerrainRasterizer here
-            ShaderProgram.unbind();
-        }
-
-        GL11C.glDisable(GL11C.GL_BLEND);
-        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, 0);
-    }
-
-    @Override
-    public void resize(int width, int height) {}
-
-    @Override
-    public void reload() {
-        try {
-            if (waterShader != null) waterShader.destroy();
-            waterShader = new ShaderProgram("WaterTranslucent")
-                    .attachStage(GL20C.GL_VERTEX_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/water/water_surface.vert"))
-                    .attachStage(GL20C.GL_FRAGMENT_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/water/water_surface.frag"))
-                    .link();
-        } catch (Exception e) {
-            NvidiumShaderPipeline.LOGGER.error("Failed to compile WaterTranslucent shader", e);
-        }
-    }
-
-    @Override
-    public void destroy() {
-        if (waterShader != null) {
-            waterShader.destroy();
-            waterShader = null;
-        }
     }
 }

@@ -1,263 +1,292 @@
 #version 460 core
+#extension GL_ARB_shading_language_include : enable
+#pragma optionNV(unroll all)
+#define UNROLL_LOOP
+#extension GL_NV_gpu_shader5 : require
+#extension GL_NV_bindless_texture : require
+#extension GL_NV_shader_buffer_load : require
+#extension GL_NV_fragment_shader_barycentric : require
 
-// ============================================================================
-// Nvidium Shader Pipeline (NSP) - Phase 5: Water & Translucency Surface Shader
-// Implements multi-octave Gerstner wave normals, Beer-Lambert optical
-// absorption, screen-space refraction, screen-space raymarched reflections,
-// Schlick Fresnel (F0 = 0.02), GGX solar specular with CSM shadows, and foam.
-// ============================================================================
+#import <nvidium:occlusion/scene.glsl>
+#import <nvidium:terrain/vertex_format.glsl>
 
-layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;
-    mat4  u_ProjMatrix;
-    mat4  u_ViewProjMatrix;
-    mat4  u_InvViewProjMatrix;
-    mat4  u_CascadeViewProj[3];
-    vec4  u_CascadeSplits;
-    vec4  u_SunDirection;
-    vec4  u_SunColor;
-    vec4  u_AmbientColor;
-    vec4  u_CameraPos;
-    vec2  u_ScreenSize;
-    vec2  _pad0;
-    float u_Time;
-    int   u_FrameIndex;
-    float u_FogStart;
-    float u_FogEnd;
-    vec4  u_FogColor;
-};
+#include "../common/scene_uniforms.glsl"
+#include "../common/options.glsl"
+#include "../common/materials.glsl"
+#include "../common/pbr_brdf.glsl"
+#include "../common/shadows.glsl"
+#include "../common/atmosphere.glsl"
+#include "../common/post_tonemap.glsl"
 
-layout(binding = 0) uniform sampler2D u_OpaqueSceneColor;
-layout(binding = 1) uniform sampler2D u_SceneDepth;
-layout(binding = 4) uniform sampler2DArrayShadow u_ShadowMap;
+layout(location = 0) out vec4 outFragColor;
 
-layout(location = 0) in vec3 v_WorldPos;
-layout(location = 1) in vec2 v_TexCoord;
-layout(location = 2) in vec2 v_LightCoord;
+layout(binding = 0) uniform sampler2D tex_diffuse;
+layout(binding = 1) uniform sampler2D tex_light;
+layout(binding = 2) uniform sampler2D tex_normal;
+layout(binding = 3) uniform sampler2D tex_specular;
+layout(binding = 4) uniform sampler2D tex_scene_color; // Feedback-loop-free opaque color copy (with mips)
+layout(binding = 5) uniform sampler2D tex_scene_depth; // Feedback-loop-free opaque depth copy
+layout(binding = 6) uniform sampler2DArray tex_shadow_map;
 
-layout(location = 0) out vec4 outHdrColor;
+layout(location = 5) in NvidiumVertexData {
+    vec2 v_uv;
+    vec3 v_color;
+    vec2 v_lightUV;
+} nv_in;
 
-const float PI = 3.14159265359;
+float sampleWaterWaveHeight(vec2 p, float t) {
+    // Domain-warped multi-directional FBM wave surface (free of periodic grid polka-dots)
+    vec2 flowA = p * 0.62 + vec2(t * 0.42, -t * 0.29);
+    vec2 flowB = vec2(p.x * 0.48 - p.y * 0.52, p.x * 0.52 + p.y * 0.48) + vec2(-t * 0.34, t * 0.46);
+    vec2 warp = vec2(noise2D(flowA * 0.85) - 0.5, noise2D(flowB * 0.85) - 0.5) * 0.55;
 
-vec3 reconstructWorldPos(vec2 uv, float depth) {
-    vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
-    vec4 worldPosH = u_InvViewProjMatrix * clip;
-    return worldPosH.xyz / worldPosH.w;
+    float hA = fbm2D(flowA + warp);
+    float hB = fbm2D(flowB - warp * 0.8);
+    float capillary = (noise2D(p * 2.85 + vec2(t * 0.95, t * 0.72)) - 0.5) * 0.16;
+    return (hA * 0.55 + hB * 0.45) + capillary;
 }
 
-int selectCascade(float viewDist) {
-    if (viewDist < u_CascadeSplits.x) return 0;
-    if (viewDist < u_CascadeSplits.y) return 1;
-    return 2;
-}
+/**
+ * Domain-warped FBM Water Surface Normal (organic at both grazing and top-down angles).
+ */
+vec3 computeWaterWaveNormal(vec3 worldPos, vec3 geomNormal, float waveAmpOpt, out float outCrestFoam) {
+    float t = u_Time.x;
+    vec2 p = worldPos.xz;
+    const float eps = 0.14;
 
-vec3 getShadowCoords(vec3 worldPos, int cascadeIdx) {
-    vec4 shadowClip = u_CascadeViewProj[cascadeIdx] * vec4(worldPos, 1.0);
-    vec3 shadowNdc = shadowClip.xyz / shadowClip.w;
-    return shadowNdc * 0.5 + 0.5;
-}
+    float hC = sampleWaterWaveHeight(p, t);
+    float hX = sampleWaterWaveHeight(p + vec2(eps, 0.0), t);
+    float hZ = sampleWaterWaveHeight(p + vec2(0.0, eps), t);
 
-float sampleWaterShadow(vec3 worldPos, float viewDist) {
-    if (viewDist >= u_CascadeSplits.z) return 1.0;
-    int cascadeIdx = selectCascade(viewDist);
-    vec3 sc = getShadowCoords(worldPos, cascadeIdx);
-    if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z <= 0.0 || sc.z >= 1.0) {
-        return 1.0;
+    float dHx = ((hX - hC) / eps) * 0.065 * waveAmpOpt;
+    float dHz = ((hZ - hC) / eps) * 0.065 * waveAmpOpt;
+
+    outCrestFoam = 0.0;
+
+    if (abs(geomNormal.y) > 0.5) {
+        return normalize(vec3(-dHx, 1.0, -dHz));
     }
-    return texture(u_ShadowMap, vec4(sc.xy, float(cascadeIdx), clamp(sc.z - 0.0006, 0.0, 1.0)));
+    return normalize(geomNormal + vec3(-dHx, 0.0, -dHz) * 0.5);
 }
 
-// ----------------------------------------------------------------------------
-// Requirement 1: Animated Gerstner Wave Normal & Crest Jacobian
-// ----------------------------------------------------------------------------
-vec3 computeGerstnerNormalAndCrest(vec2 xz, float time, out float crestFactor) {
-    // (dirX, dirZ, steepness, wavelength)
-    const vec4 waves[6] = vec4[6](
-        vec4( 0.85,  0.52, 0.24, 4.20),
-        vec4(-0.42,  0.91, 0.20, 2.65),
-        vec4( 0.61, -0.79, 0.17, 1.55),
-        vec4(-0.88, -0.47, 0.14, 0.88),
-        vec4( 0.26,  0.96, 0.11, 0.47),
-        vec4(-0.73,  0.68, 0.09, 0.26)
-    );
+float sampleSeabedCaustics(vec3 worldPos, float timeSec) {
+    vec2 p1 = worldPos.xz * 0.75 + vec2(timeSec * 0.48, -timeSec * 0.35);
+    vec2 p2 = worldPos.xz * 0.98 + vec2(-timeSec * 0.41, timeSec * 0.52);
+    float n1 = abs(noise2D(p1 * 2.2) - 0.5);
+    float n2 = abs(noise2D(p2 * 2.5) - 0.5);
+    float c = clamp(1.0 - (n1 + n2) * 3.4, 0.0, 1.0);
+    return pow(c, 2.2) * 1.75;
+}
 
-    vec3 tangent   = vec3(1.0, 0.0, 0.0);
-    vec3 bitangent = vec3(0.0, 0.0, 1.0);
-    float jacobian = 1.0;
-
-    for (int i = 0; i < 6; ++i) {
-        vec2  D = normalize(waves[i].xy);
-        float Q = waves[i].z;
-        float wl = waves[i].w;
-        float k = (2.0 * PI) / wl;
-        float c = sqrt(9.81 / k);
-        float phase = k * (dot(D, xz) - c * time);
-
-        float WA = Q / 6.0;
-        float s  = sin(phase);
-        float co = cos(phase);
-
-        tangent   += vec3(-D.x * D.x * WA * s, D.x * WA * co, -D.x * D.y * WA * s);
-        bitangent += vec3(-D.x * D.y * WA * s, D.y * WA * co, -D.y * D.y * WA * s);
-        jacobian  -= WA * co;
+vec4 traceTranslucentSSR(vec3 camRelPos, vec3 R) {
+    if (u_ShadowParams.z < 0.5) {
+        return vec4(0.0);
     }
+    float jitter = interleavedGradientNoise(gl_FragCoord.xy, 0.0);
+    vec3 rayPos = camRelPos + R * (0.25 + jitter * 0.20);
+    vec3 stepVec = R * 0.55;
 
-    crestFactor = smoothstep(0.52, 0.25, jacobian);
-    return normalize(cross(bitangent, tangent));
-}
+    for (int i = 0; i < 12; i++) {
+        rayPos += stepVec;
+        stepVec *= 1.18;
 
-// ----------------------------------------------------------------------------
-// Sky Fallback for Screen-Space Reflections
-// ----------------------------------------------------------------------------
-vec3 computeSkyReflection(vec3 R, vec3 sunDir) {
-    float elevation = clamp(R.y, 0.0, 1.0);
-    float sunElevation = clamp(sunDir.y, -1.0, 1.0);
-    float dayFactor = smoothstep(-0.15, 0.25, sunElevation);
-
-    vec3 zenith  = mix(vec3(0.01, 0.02, 0.05), vec3(0.12, 0.34, 0.86) * max(u_AmbientColor.rgb * 1.3, vec3(0.25)), dayFactor);
-    vec3 horizon = mix(vec3(0.03, 0.05, 0.09), vec3(0.55, 0.74, 0.98) * max(u_SunColor.rgb, vec3(0.35)), dayFactor);
-    return mix(horizon, zenith, pow(elevation, 0.65));
-}
-
-// ----------------------------------------------------------------------------
-// Requirement 5: Screen-Space Reflections (SSR) Raymarch
-// ----------------------------------------------------------------------------
-vec3 traceScreenSpaceReflection(vec3 startWorldPos, vec3 R, vec3 sunDir) {
-    const int   SSR_STEPS = 24;
-    const float MAX_SSR_DIST = 48.0;
-
-    vec3 skyFallback = computeSkyReflection(R, sunDir);
-    float stepSize = MAX_SSR_DIST / float(SSR_STEPS);
-
-    for (int i = 1; i <= SSR_STEPS; ++i) {
-        float t = float(i) * stepSize;
-        vec3 marchPos = startWorldPos + R * t;
-
-        vec4 clip = u_ViewProjMatrix * vec4(marchPos, 1.0);
-        if (clip.w <= 0.0) break;
-
-        vec3 ndc = clip.xyz / clip.w;
-        vec2 sampleUv = ndc.xy * 0.5 + 0.5;
-        float rayDepth = ndc.z * 0.5 + 0.5;
-
-        if (sampleUv.x <= 0.01 || sampleUv.x >= 0.99 ||
-            sampleUv.y <= 0.01 || sampleUv.y >= 0.99 ||
-            rayDepth >= 1.0) {
+        vec3 uvDepth = projectCameraRelativeToUVDepth(rayPos);
+        if (uvDepth.x <= 0.01 || uvDepth.x >= 0.99 || uvDepth.y <= 0.01 || uvDepth.y >= 0.99 || uvDepth.z <= 0.0 || uvDepth.z >= 1.0) {
             break;
         }
+        float sceneDepth = textureLod(tex_scene_depth, uvDepth.xy, 0.0).r;
+        if (sceneDepth >= 0.9999) continue;
 
-        float sceneDepth = texture(u_SceneDepth, sampleUv).r;
-        if (sceneDepth < 0.999999 && rayDepth > sceneDepth) {
-            vec3 sceneWorld = reconstructWorldPos(sampleUv, sceneDepth);
-            float thickness = length(marchPos - sceneWorld);
-            if (thickness < stepSize * 2.5) {
-                vec2 edgeDist = smoothstep(vec2(0.0), vec2(0.12), sampleUv) *
-                                (1.0 - smoothstep(vec2(0.88), vec2(1.0), sampleUv));
-                float vignette = edgeDist.x * edgeDist.y;
-                vec3 hitColor = texture(u_OpaqueSceneColor, sampleUv).rgb;
-                return mix(skyFallback, hitColor, vignette);
-            }
+        vec3 sceneRelPos = reconstructCameraRelativePos(uvDepth.xy, sceneDepth);
+        float diff = length(rayPos) - length(sceneRelPos);
+        if (diff > 0.0 && diff < length(stepVec) * 1.9) {
+            vec3 hitSrgb = textureLod(tex_scene_color, uvDepth.xy, 0.0).rgb;
+            vec2 edgeFade = smoothstep(vec2(0.0), vec2(0.12), uvDepth.xy) * (1.0 - smoothstep(vec2(0.88), vec2(1.0), uvDepth.xy));
+            return vec4(srgbToLinear(hitSrgb), edgeFade.x * edgeFade.y);
         }
     }
-
-    return skyFallback;
-}
-
-// ----------------------------------------------------------------------------
-// Requirement 7: Cook-Torrance GGX Specular Functions
-// ----------------------------------------------------------------------------
-float distributionGGX(vec3 N, vec3 H, float roughness) {
-    float a  = roughness * roughness;
-    float a2 = a * a;
-    float NdotH  = max(dot(N, H), 0.0);
-    float NdotH2 = NdotH * NdotH;
-    float denom  = NdotH2 * (a2 - 1.0) + 1.0;
-    return a2 / max(PI * denom * denom, 1e-6);
-}
-
-float geometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    float r = roughness + 1.0;
-    float k = (r * r) / 8.0;
-    float NdotV = max(dot(N, V), 0.0);
-    float NdotL = max(dot(N, L), 0.0);
-    float ggxV  = NdotV / max(NdotV * (1.0 - k) + k, 1e-6);
-    float ggxL  = NdotL / max(NdotL * (1.0 - k) + k, 1e-6);
-    return ggxV * ggxL;
+    return vec4(0.0);
 }
 
 void main() {
-    vec2 screenUv = gl_FragCoord.xy / u_ScreenSize;
-    vec3 camToSurface = v_WorldPos - u_CameraPos.xyz;
-    float surfaceDistance = length(camToSurface);
-    vec3 V = (surfaceDistance > 1e-5) ? (-camToSurface / surfaceDistance) : vec3(0.0, 1.0, 0.0);
-    vec3 L = normalize(u_SunDirection.xyz);
+    uint quadId = uint(gl_PrimitiveID) >> 4;
+    bool triangle0 = ((uint(gl_PrimitiveID) >> 3) & 1u) == 0u;
+    uvec3 triIndices = triangle0 ? uvec3(0u, 1u, 2u) : uvec3(2u, 3u, 0u);
 
-    // Requirement 1: Animated surface normal using Gerstner waves
-    float crestFoam = 0.0;
-    vec3 N = computeGerstnerNormalAndCrest(v_WorldPos.xz, u_Time, crestFoam);
+    Vertex V0 = terrainData[(quadId << 2) + triIndices.x];
+    Vertex V1 = terrainData[(quadId << 2) + triIndices.y];
+    Vertex V2 = terrainData[(quadId << 2) + triIndices.z];
 
-    // Requirement 2: Unproject seabed depth & compute water column depth
-    float rawSceneDepth = texture(u_SceneDepth, screenUv).r;
-    vec3 floorWorldPos = reconstructWorldPos(screenUv, rawSceneDepth);
-    float floorDistance = length(floorWorldPos - u_CameraPos.xyz);
-    float deltaDepth = max(floorDistance - surfaceDistance, 0.0);
-
-    // Requirement 3: Screen-space refraction distorted by wave normal & deltaDepth
-    float distortionScale = clamp(deltaDepth * 0.025, 0.0, 0.045) / max(surfaceDistance * 0.15, 1.0);
-    vec2 refractUv = clamp(screenUv + N.xz * distortionScale, vec2(0.001), vec2(0.999));
-
-    // Reject refracted samples that lie in front of the water surface
-    float refractedDepthSample = texture(u_SceneDepth, refractUv).r;
-    vec3 refractedWorldPos = reconstructWorldPos(refractUv, refractedDepthSample);
-    float refractedFloorDist = length(refractedWorldPos - u_CameraPos.xyz);
-    if (refractedFloorDist < surfaceDistance) {
-        refractUv = screenUv;
-        refractedFloorDist = floorDistance;
+    vec2 uv = nv_in.v_uv;
+    vec4 texSample = texture(tex_diffuse, uv, 0.0);
+    if (texSample.a < 0.02) {
+        discard;
     }
-    deltaDepth = max(refractedFloorDist - surfaceDistance, 0.0);
 
-    vec3 refractedSceneColor = texture(u_OpaqueSceneColor, refractUv).rgb;
+    vec3 pos0 = decodeVertexPosition(V0);
+    vec3 pos1 = decodeVertexPosition(V1);
+    vec3 pos2 = decodeVertexPosition(V2);
+    vec3 geomNormal = cross(pos1 - pos0, pos2 - pos0);
+    float geomLen = length(geomNormal);
+    geomNormal = (geomLen > 1.0e-6) ? (geomNormal / geomLen) : vec3(0.0, 1.0, 0.0);
+    if (!gl_FrontFacing) {
+        geomNormal = -geomNormal;
+    }
 
-    // Requirement 4: Beer-Lambert absorption exp(-sigmaExtinction * deltaDepth)
-    const vec3 sigmaExtinction = vec3(0.42, 0.13, 0.055);
-    vec3 transmittance = exp(-sigmaExtinction * deltaDepth);
-    vec3 deepWaterInScatter = vec3(0.012, 0.085, 0.145) * (u_AmbientColor.rgb + u_SunColor.rgb * max(L.y, 0.0) * 0.35);
-    vec3 refractionColor = refractedSceneColor * transmittance + deepWaterInScatter * (1.0 - transmittance);
+    vec3 rawVCol = nv_in.v_color;
+    float maxChannel = max(rawVCol.r, max(rawVCol.g, rawVCol.b));
+    vec3 biomeTint = (maxChannel > 1.0e-4) ? (rawVCol / maxChannel) : vec3(1.0);
 
-    // Requirement 5: Screen-Space Reflections (SSR) with sky fallback
-    vec3 R = reflect(-V, N);
-    vec3 reflectionColor = traceScreenSpaceReflection(v_WorldPos, R, L);
+    vec2 lightUV = nv_in.v_lightUV;
+    float blockLight = clamp((lightUV.x - 0.03125) / 0.9375, 0.0, 1.0);
+    float skyLight   = clamp((lightUV.y - 0.03125) / 0.9375, 0.0, 1.0);
 
-    // Requirement 6: Evaluate Schlick Fresnel reflectance (F0 = 0.02) & blend
-    const float F0 = 0.02;
-    float NdotV = max(dot(N, V), 0.0);
-    float fresnel = F0 + (1.0 - F0) * pow(clamp(1.0 - NdotV, 0.0, 1.0), 5.0);
-    vec3 waterColor = mix(refractionColor, reflectionColor, fresnel);
+    vec2 screenUV = gl_FragCoord.xy * u_ScreenSize.zw;
+    vec3 waterRelPos = reconstructCameraRelativePos(screenUV, gl_FragCoord.z);
+    vec3 worldPos = waterRelPos + u_CameraPos.xyz;
+    float surfaceDist = length(waterRelPos);
+    vec3 V = normalize(waterRelPos); // Ray from camera to surface
+    vec3 viewToCam = -V;
 
-    // Requirement 7: Cook-Torrance GGX solar specular highlight with CSM shadow
-    const float waterRoughness = 0.045;
-    vec3 H = normalize(V + L);
-    float D = distributionGGX(N, H, waterRoughness);
-    float G = geometrySmith(N, V, L, waterRoughness);
-    float F_spec = F0 + (1.0 - F0) * pow(clamp(1.0 - max(dot(H, V), 0.0), 0.0, 1.0), 5.0);
-    float NdotL = max(dot(N, L), 0.0);
+    uint materialId = decodeVertexMaterial(V0);
+    int toneOp = int(round(u_PostParams.w));
+    float exposure = u_PostParams.x;
 
-    float shadowVis = (NdotL > 0.001) ? sampleWaterShadow(v_WorldPos, surfaceDistance) : 0.0;
-    vec3 sunRadiance = u_SunColor.rgb * max(u_SunColor.a, 1.0);
-    vec3 sunSpecular = vec3((D * G * F_spec) / max(4.0 * NdotV * NdotL, 1e-4)) * sunRadiance * NdotL * shadowVis;
-    waterColor += sunSpecular;
+    // =========================================================================
+    // PATH A: PHYSICAL WATER SURFACE (MAT_WATER)
+    // =========================================================================
+    if (materialId == MAT_WATER) {
+        float crestFoam = 0.0;
+        vec3 N = computeWaterWaveNormal(worldPos, geomNormal, OPT_WATER_WAVE_HEIGHT, crestFoam);
 
-    // Requirement 8: Shore/crest foam and distance fog blend
-    float shoreFoam = (1.0 - smoothstep(0.0, 0.65, deltaDepth)) * smoothstep(0.0, 0.04, deltaDepth);
-    float foamPattern = 0.5 + 0.5 * sin(v_WorldPos.x * 6.0 + u_Time * 2.2) * cos(v_WorldPos.z * 6.0 - u_Time * 1.8);
-    float totalFoam = clamp(shoreFoam * (0.65 + 0.35 * foamPattern) + crestFoam * 0.45, 0.0, 1.0);
-    vec3 foamRadiance = vec3(0.92, 0.96, 1.0) * (u_AmbientColor.rgb + sunRadiance * max(NdotL, 0.15) * shadowVis * 0.6);
-    waterColor = mix(waterColor, foamRadiance, totalFoam);
+        // Refracted screen UV & depth-aware clamping
+        vec2 refrOffset = N.xz * (0.032 * OPT_WATER_WAVE_HEIGHT) / max(1.0 + surfaceDist * 0.08, 1.0);
+        vec2 refrUV = clamp(screenUV + refrOffset, vec2(0.002), vec2(0.998));
 
-    float fogSpan = max(u_FogEnd - u_FogStart, 1e-3);
-    float fogFactor = clamp((surfaceDistance - u_FogStart) / fogSpan, 0.0, 1.0);
-    fogFactor = fogFactor * fogFactor * (3.0 - 2.0 * fogFactor);
-    waterColor = mix(waterColor, u_FogColor.rgb, fogFactor * clamp(u_FogColor.a, 0.0, 1.0));
+        float opaqueDepth = textureLod(tex_scene_depth, refrUV, 0.0).r;
+        vec3 opaqueRelPos = reconstructCameraRelativePos(refrUV, opaqueDepth);
+        float opaqueDist = length(opaqueRelPos);
 
-    outHdrColor = vec4(max(waterColor, vec3(0.0)), 1.0);
+        // Prevent foreground objects from leaking into water refraction
+        if (opaqueDist < surfaceDist) {
+            refrUV = screenUV;
+            opaqueDepth = textureLod(tex_scene_depth, screenUV, 0.0).r;
+            opaqueRelPos = reconstructCameraRelativePos(screenUV, opaqueDepth);
+            opaqueDist = length(opaqueRelPos);
+        }
+
+        float waterDepth = (opaqueDepth >= 0.9999) ? 48.0 : max(0.0, opaqueDist - surfaceDist);
+        vec3 refractedLinear = srgbToLinear(textureLod(tex_scene_color, refrUV, 0.0).rgb) / max(exposure, 0.25);
+
+        // Cascaded shadow lookup on water surface
+        int dummyCasc = 0;
+        float shadowVis = evaluateCascadedShadow(
+                tex_shadow_map,
+                waterRelPos,
+                geomNormal,
+                normalize(u_ShadowLightDir.xyz),
+                OPT_SHADOW_SOFTNESS,
+                gl_FragCoord.xy,
+                dummyCasc
+        );
+
+        // Underwater Seabed Caustics on refracted floor
+        if (OPT_WATER_CAUSTICS > 0.5 && opaqueDepth < 0.9999 && waterDepth < 28.0) {
+            vec3 seabedWorldPos = opaqueRelPos + u_CameraPos.xyz;
+            float caustics = sampleSeabedCaustics(seabedWorldPos, u_Time.x);
+            float depthFade = exp(-waterDepth * 0.14);
+            refractedLinear += refractedLinear * u_SunColor.rgb * caustics * shadowVis * depthFade * 0.75;
+        }
+
+        // Beer-Lambert Spectral Water Absorption + Deep Water In-Scattering
+        float clarity = max(0.2, OPT_WATER_CLARITY);
+        vec3 sigma = vec3(0.38, 0.11, 0.055) / clarity;
+        vec3 transmittance = exp(-sigma * waterDepth);
+
+        vec3 waterBiomeTint = mix(vec3(0.04, 0.26, 0.36), srgbToLinear(biomeTint) * 0.42, 0.55);
+        vec3 sunDir = normalize(u_SunDirection.xyz);
+        vec3 moonDir = normalize(u_MoonDirection.xyz);
+        vec3 ambientScatter = waterBiomeTint * (u_SkyColor.rgb * skyLight * 0.85 + u_SunColor.rgb * u_SunColor.w * shadowVis * 0.22 + u_BlockLightColor.rgb * pow(blockLight, 2.0));
+        vec3 underwaterBody = mix(ambientScatter, refractedLinear, transmittance);
+
+        // Schlick Fresnel (F0 = 0.02 for water)
+        float NoV = clamp(dot(N, viewToCam), 0.001, 1.0);
+        float fresnel = 0.02 + 0.98 * pow(1.0 - NoV, 5.0);
+
+        // Sky + Cloud Reflection + Screen-Space Reflection (SSR)
+        vec3 R = reflect(V, N);
+        R.y = max(R.y, 0.02);
+        vec3 skyRefl = evaluatePhysicalSky(normalize(R), 1.0, OPT_CLOUD_COVERAGE, OPT_ATMOS_HAZINESS) * clamp(skyLight * skyLight, 0.08, 1.0);
+        vec4 ssr = traceTranslucentSSR(waterRelPos, R);
+        vec3 reflLinear = mix(skyRefl, ssr.rgb / max(exposure, 0.25), ssr.a);
+
+        // Direct Sun & Moon Specular Glitter on Water Waves
+        vec3 H_sun = normalize(viewToCam + sunDir);
+        float D_sun = D_GGX(clamp(dot(N, H_sun), 0.0, 1.0), 0.032);
+        vec3 sunSpec = u_SunColor.rgb * u_SunColor.w * D_sun * shadowVis * clamp(dot(N, sunDir), 0.0, 1.0) * 0.35;
+
+        vec3 H_moon = normalize(viewToCam + moonDir);
+        float D_moon = D_GGX(clamp(dot(N, H_moon), 0.0, 1.0), 0.038);
+        vec3 moonSpec = u_MoonColor.rgb * u_MoonColor.w * D_moon * shadowVis * clamp(dot(N, moonDir), 0.0, 1.0) * 0.35;
+
+        vec3 surfaceLinear = mix(underwaterBody, reflLinear, fresnel) + sunSpec + moonSpec;
+
+        // Shoreline Contact Foam & Wave Crest Foam
+        float vertDist = abs(opaqueRelPos.y - waterRelPos.y);
+        float shoreRaw = clamp(1.0 - waterDepth / 0.72, 0.0, 1.0) * clamp(1.0 - vertDist / 0.45, 0.0, 1.0);
+        float foamPattern = fbm2D(worldPos.xz * 3.8 + vec2(u_Time.x * 0.45, -u_Time.x * 0.35));
+        float shoreFoam = smoothstep(0.32, 0.78, shoreRaw * (0.65 + 0.65 * foamPattern));
+        float totalFoam = clamp(shoreFoam + crestFoam * 0.35 * smoothstep(0.2, 1.0, skyLight), 0.0, 0.92);
+
+        if (totalFoam > 0.01) {
+            vec3 foamLit = (u_SkyColor.rgb * skyLight + u_SunColor.rgb * u_SunColor.w * shadowVis * 0.42 + u_BlockLightColor.rgb * blockLight) * 0.85;
+            surfaceLinear = mix(surfaceLinear, foamLit, totalFoam);
+        }
+
+        // Distance aerial perspective (disk-free so Sun/Moon never bleed through distant water)
+        float fogStart = max(32.0, u_FogParams.x * 0.85);
+        float fogEnd = max(fogStart + 48.0, u_FogParams.y * 1.15);
+        float distHaze = smoothstep(fogStart, fogEnd, surfaceDist) * 0.85;
+        vec3 horizonSky = evaluateAtmosphericHazeSky(normalize(vec3(V.x, max(V.y, 0.04), V.z)), OPT_ATMOS_HAZINESS);
+        surfaceLinear = mix(surfaceLinear, horizonSky, distHaze);
+
+        vec3 tonemapped = applySelectedTonemap(applyColorGrading(surfaceLinear * exposure, u_PostParams.z), toneOp);
+        outFragColor = vec4(linearToSrgb(tonemapped), 1.0);
+        return;
+    }
+
+    // =========================================================================
+    // PATH B: DIELECTRIC TRANSLUCENTS (STAINED/CLEAR GLASS, ICE, SLIME, HONEY, PORTAL)
+    // =========================================================================
+    vec3 N = geomNormal;
+    float roughness = (materialId == MAT_ICE || materialId == MAT_SLIME_HONEY) ? 0.16 : 0.04;
+    float mipBlur = (materialId == MAT_ICE) ? 1.6 : ((materialId == MAT_SLIME_HONEY) ? 2.4 : 0.0);
+
+    vec2 refrUV = clamp(screenUV + N.xz * 0.008, vec2(0.002), vec2(0.998));
+    vec3 bgLinear = srgbToLinear(textureLod(tex_scene_color, refrUV, mipBlur).rgb) / max(exposure, 0.25);
+
+    vec3 tintLinear = srgbToLinear(texSample.rgb * biomeTint);
+    float alpha = clamp(texSample.a, 0.08, 0.96);
+
+    float NoV = clamp(dot(N, viewToCam), 0.001, 1.0);
+    float fresnel = 0.04 + 0.96 * pow(1.0 - NoV, 5.0);
+
+    vec3 R = reflect(V, N);
+    vec3 skyRefl = evaluatePhysicalSky(normalize(vec3(R.x, max(R.y, 0.02), R.z)), 1.0, OPT_CLOUD_COVERAGE, OPT_ATMOS_HAZINESS) * skyLight;
+    vec3 sunDir = normalize(u_SunDirection.xyz);
+    vec3 H_sun = normalize(viewToCam + sunDir);
+    float spec = D_GGX(clamp(dot(N, H_sun), 0.0, 1.0), max(0.04, roughness * roughness)) * clamp(dot(N, sunDir), 0.0, 1.0);
+    vec3 specGlow = u_SunColor.rgb * u_SunColor.w * spec * 0.25;
+
+    vec3 litTint = tintLinear * (u_SkyColor.rgb * skyLight * 0.9 + u_BlockLightColor.rgb * pow(blockLight, 2.0) * 1.3 + vec3(0.12));
+    if (materialId == MAT_PORTAL) {
+        litTint = tintLinear * 3.2 * OPT_EMISSIVE_STRENGTH;
+    }
+
+    // Filter background light through stained glass / ice tint + add Fresnel reflection
+    vec3 transmitted = bgLinear * mix(vec3(1.0), tintLinear * 1.35, alpha * 0.78);
+    vec3 combinedLinear = mix(transmitted, litTint, alpha * 0.55) + (skyRefl * fresnel + specGlow) * (1.0 - roughness * 0.5);
+
+    vec3 tonemapped = applySelectedTonemap(applyColorGrading(combinedLinear * exposure, u_PostParams.z), toneOp);
+    outFragColor = vec4(linearToSrgb(tonemapped), 1.0);
 }

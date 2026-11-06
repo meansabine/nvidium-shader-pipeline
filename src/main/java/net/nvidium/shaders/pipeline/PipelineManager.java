@@ -1,136 +1,236 @@
 package net.nvidium.shaders.pipeline;
 
+import me.cortex.nvidium.api0.INvidiumShaderHook;
+import me.cortex.nvidium.gl.shader.Shader;
 import net.minecraft.client.Minecraft;
 import net.nvidium.shaders.NvidiumShaderPipeline;
+import net.nvidium.shaders.config.PipelineConfig;
+import net.nvidium.shaders.pack.ShaderPackManager;
 import net.nvidium.shaders.pipeline.gbuffer.GBuffer;
 import net.nvidium.shaders.pipeline.gl.FullscreenQuad;
 import net.nvidium.shaders.pipeline.passes.*;
 import net.nvidium.shaders.pipeline.shadow.CascadedShadowMap;
+import net.nvidium.shaders.pipeline.targets.HdrTargets;
+import net.nvidium.shaders.pipeline.targets.SceneCopyTargets;
+import net.nvidium.shaders.pipeline.textures.PbrAtlasHooks;
+import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
 import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
- * Central orchestrator for the Nvidium Shader Pipeline.
- * Manages framebuffers, uniform updates, shadow cascades, and pass execution sequence.
+ * Central orchestrator for the Nvidium Deferred & Mesh-Shader Pipeline.
  */
 public class PipelineManager {
-    private boolean enabled = true;
-    private int width;
-    private int height;
-    private int frameIndex = 0;
-    private float totalTime = 0.0f;
+    private static PipelineManager INSTANCE;
 
-    private GBuffer gbuffer;
-    private CascadedShadowMap shadowMap;
+    private final List<IShaderPass> passes = new ArrayList<>();
+    private boolean initialized = false;
+    private int lastWidth = -1;
+    private int lastHeight = -1;
+
+    // Shared resources
+    private GBuffer gBuffer;
+    private CascadedShadowMap csm;
+    private HdrTargets hdrTargets;
+    private SceneCopyTargets sceneCopyTargets;
     private SceneUniforms sceneUniforms;
+    private PackOptionsUniforms packOptionsUniforms;
+    private PbrAtlasHooks pbrHooks;
 
-    private final Map<String, IShaderPass> passes = new LinkedHashMap<>();
+    // Active passes
+    private ShadowPass shadowPass;
+    private GBufferPass gBufferPass;
+    private DeferredLightingPass deferredLightingPass;
+    private VolumetricFogPass volumetricFogPass;
+    private WaterTranslucentPass waterTranslucentPass;
+    private PostProcessPass postProcessPass;
 
-    public void init() {
+    public static PipelineManager getInstance() {
+        if (INSTANCE == null) {
+            INSTANCE = new PipelineManager();
+        }
+        return INSTANCE;
+    }
+
+    private PipelineManager() {}
+
+    public synchronized void init() {
+        if (initialized) return;
+
+        NvidiumShaderPipeline.LOGGER.info("Initializing Nvidium Shader Pipeline (Active pack: {})...",
+                ShaderPackManager.get().getActivePack().getName());
+        ShaderPackManager.get().clearError();
+
         Minecraft mc = Minecraft.getInstance();
-        this.width = Math.max(1, mc.getWindow().getWidth());
-        this.height = Math.max(1, mc.getWindow().getHeight());
+        int width = mc.getWindow() != null ? Math.max(1, mc.getWindow().getWidth()) : 1920;
+        int height = mc.getWindow() != null ? Math.max(1, mc.getWindow().getHeight()) : 1080;
+        this.lastWidth = width;
+        this.lastHeight = height;
 
-        FullscreenQuad.init();
+        PipelineConfig cfg = PipelineConfig.get();
 
-        this.gbuffer = new GBuffer(width, height);
-        this.shadowMap = new CascadedShadowMap();
-        this.sceneUniforms = new SceneUniforms();
+        // 1. Initialize shared GPU resources
+        gBuffer = new GBuffer(width, height);
+        csm = new CascadedShadowMap(cfg.shadowResolution, cfg.shadowDistance);
+        hdrTargets = new HdrTargets(width, height);
+        sceneCopyTargets = new SceneCopyTargets(width, height);
+        sceneUniforms = new SceneUniforms();
+        packOptionsUniforms = new PackOptionsUniforms();
+        pbrHooks = new PbrAtlasHooks();
 
-        // Register default passes in sequential order
-        registerPass(new ShadowPass());
-        registerPass(new GBufferPass());
-        registerPass(new DeferredLightingPass());
-        registerPass(new VolumetricFogPass());
-        registerPass(new WaterTranslucentPass());
-        registerPass(new PostProcessPass());
+        // 2. Initialize passes
+        shadowPass = new ShadowPass(csm, sceneUniforms, packOptionsUniforms);
+        gBufferPass = new GBufferPass(gBuffer, sceneUniforms, packOptionsUniforms, pbrHooks);
+        deferredLightingPass = new DeferredLightingPass(gBuffer, csm, hdrTargets, sceneUniforms, packOptionsUniforms);
+        volumetricFogPass = new VolumetricFogPass(csm, hdrTargets, sceneUniforms, packOptionsUniforms);
+        waterTranslucentPass = new WaterTranslucentPass(sceneCopyTargets, csm, sceneUniforms, packOptionsUniforms, pbrHooks);
+        postProcessPass = new PostProcessPass(gBuffer, hdrTargets, sceneCopyTargets, sceneUniforms, packOptionsUniforms);
 
-        // Initialize all passes
-        for (IShaderPass pass : passes.values()) {
-            pass.init(this);
+        registerPass(shadowPass);
+        registerPass(gBufferPass);
+        registerPass(deferredLightingPass);
+        registerPass(volumetricFogPass);
+        registerPass(waterTranslucentPass);
+        registerPass(postProcessPass);
+
+        for (IShaderPass pass : passes) {
+            pass.init();
         }
 
-        NvidiumShaderPipeline.LOGGER.info("PipelineManager initialized with {} render passes.", passes.size());
+        initialized = true;
+        NvidiumShaderPipeline.LOGGER.info("Nvidium Shader Pipeline initialized successfully ({} passes).", passes.size());
     }
 
     public void registerPass(IShaderPass pass) {
-        passes.put(pass.getId(), pass);
+        this.passes.add(pass);
     }
 
-    public IShaderPass getPass(String id) {
-        return passes.get(id);
-    }
-
-    public void render(RenderContext context) {
-        if (!enabled) return;
-
-        // Check for window resize
-        if (context.screenWidth() != width || context.screenHeight() != height) {
-            resize(context.screenWidth(), context.screenHeight());
+    public void onFrameSetup(RenderContext ctx) {
+        if (!initialized) {
+            init();
         }
+        int w = ctx.getScreenWidth();
+        int h = ctx.getScreenHeight();
+        if (w != lastWidth || h != lastHeight) {
+            onResize(w, h);
+        }
+        sceneUniforms.updateFromFrame(ctx, packOptionsUniforms);
+    }
 
-        frameIndex++;
-        totalTime += context.tickDelta() / 20.0f;
-
-        // 1. Update UBO with scene parameters
-        sceneUniforms.update(
-                context.projectionMatrix(),
-                context.modelViewMatrix(),
-                context.camera(),
-                shadowMap,
-                context.level(),
-                width,
-                height,
-                totalTime,
-                frameIndex
-        );
-
-        // 2. Execute pipeline passes in order
-        for (IShaderPass pass : passes.values()) {
-            if (pass.isEnabled()) {
-                pass.execute(this, context);
-            }
+    public void executeShadowPass(INvidiumShaderHook.ShadowPassContext shadowCtx, RenderContext ctx) {
+        if (initialized && shadowPass != null && shadowPass.isEnabled()) {
+            shadowPass.executeShadowCascades(shadowCtx, ctx);
         }
     }
 
-    public void resize(int newWidth, int newHeight) {
-        this.width = Math.max(1, newWidth);
-        this.height = Math.max(1, newHeight);
+    public Shader getCustomTerrainShader() {
+        if (!initialized || gBufferPass == null) return null;
+        return gBufferPass.getCustomTerrainShader();
+    }
 
-        if (gbuffer != null) gbuffer.resize(width, height);
-        for (IShaderPass pass : passes.values()) {
+    public Shader getCustomTemporalTerrainShader() {
+        if (!initialized || gBufferPass == null) return null;
+        return gBufferPass.getCustomTemporalTerrainShader();
+    }
+
+    public Shader getCustomTranslucentShader() {
+        if (!initialized || waterTranslucentPass == null) return null;
+        return waterTranslucentPass.getCustomTranslucentShader();
+    }
+
+    public void bindTerrainTextures() {
+        if (initialized && gBufferPass != null) {
+            gBufferPass.bindLabPbrTextures();
+        }
+    }
+
+    public void bindTranslucentTextures() {
+        if (initialized && waterTranslucentPass != null) {
+            waterTranslucentPass.bindTranslucentTextures();
+        }
+    }
+
+    public void executePreTerrain(RenderContext ctx) {
+        if (initialized && gBufferPass != null && gBufferPass.isEnabled()) {
+            gBufferPass.execute(ctx);
+        }
+    }
+
+    public void executePostTerrain(RenderContext ctx) {
+        if (!initialized) return;
+        if (deferredLightingPass != null && deferredLightingPass.isEnabled()) {
+            deferredLightingPass.execute(ctx);
+        }
+        if (volumetricFogPass != null && volumetricFogPass.isEnabled()) {
+            volumetricFogPass.execute(ctx);
+        }
+        if (postProcessPass != null && postProcessPass.isEnabled()) {
+            postProcessPass.execute(ctx);
+        }
+    }
+
+    public void executePreTranslucent(RenderContext ctx) {
+        if (initialized && waterTranslucentPass != null && waterTranslucentPass.isEnabled()) {
+            waterTranslucentPass.execute(ctx);
+        }
+    }
+
+    public void executePostTranslucent(RenderContext ctx) {
+        if (initialized && postProcessPass != null && postProcessPass.isEnabled()) {
+            postProcessPass.executeFinalComposite(ctx);
+        }
+    }
+
+    public synchronized void onResize(int width, int height) {
+        if (!initialized || width <= 0 || height <= 0) return;
+        this.lastWidth = width;
+        this.lastHeight = height;
+
+        gBuffer.resize(width, height);
+        hdrTargets.resize(width, height);
+        sceneCopyTargets.resize(width, height);
+        sceneUniforms.resetTemporalHistory();
+
+        for (IShaderPass pass : passes) {
             pass.resize(width, height);
         }
     }
 
-    public void reloadShaders() {
-        NvidiumShaderPipeline.LOGGER.info("Reloading all Nvidium pipeline shaders...");
-        for (IShaderPass pass : passes.values()) {
-            pass.reload();
-        }
+    public synchronized void reload() {
+        NvidiumShaderPipeline.LOGGER.info("Reloading Nvidium Shader Pipeline...");
+        ShaderPackManager.get().discoverPacks();
+        destroy();
+        init();
     }
 
-    public void destroy() {
-        for (IShaderPass pass : passes.values()) {
+    public synchronized void destroy() {
+        if (!initialized) return;
+        for (IShaderPass pass : passes) {
             pass.destroy();
         }
         passes.clear();
 
-        if (gbuffer != null) { gbuffer.destroy(); gbuffer = null; }
-        if (shadowMap != null) { shadowMap.destroy(); shadowMap = null; }
-        if (sceneUniforms != null) { sceneUniforms.destroy(); sceneUniforms = null; }
+        if (gBuffer != null) { gBuffer.delete(); gBuffer = null; }
+        if (csm != null) { csm.delete(); csm = null; }
+        if (hdrTargets != null) { hdrTargets.delete(); hdrTargets = null; }
+        if (sceneCopyTargets != null) { sceneCopyTargets.delete(); sceneCopyTargets = null; }
+        if (sceneUniforms != null) { sceneUniforms.delete(); sceneUniforms = null; }
+        if (packOptionsUniforms != null) { packOptionsUniforms.delete(); packOptionsUniforms = null; }
+        if (pbrHooks != null) { pbrHooks.delete(); pbrHooks = null; }
+
         FullscreenQuad.destroy();
+        initialized = false;
     }
 
-    public GBuffer getGbuffer() { return gbuffer; }
-    public CascadedShadowMap getShadowMap() { return shadowMap; }
+    public boolean isInitialized() {
+        return initialized;
+    }
+
+    public GBuffer getGBuffer() { return gBuffer; }
+    public CascadedShadowMap getCsm() { return csm; }
+    public HdrTargets getHdrTargets() { return hdrTargets; }
     public SceneUniforms getSceneUniforms() { return sceneUniforms; }
-    public int getWidth() { return width; }
-    public int getHeight() { return height; }
-    public boolean isEnabled() { return enabled; }
-    public void setEnabled(boolean enabled) { this.enabled = enabled; }
+    public PackOptionsUniforms getPackOptionsUniforms() { return packOptionsUniforms; }
 }

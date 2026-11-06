@@ -1,29 +1,176 @@
 package net.nvidium.shaders.pipeline.passes;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.GlStateManager;
 import net.minecraft.client.Minecraft;
-import net.minecraft.resources.ResourceLocation;
-import net.nvidium.shaders.NvidiumShaderPipeline;
-import net.nvidium.shaders.pipeline.PipelineManager;
+import net.nvidium.shaders.pack.ShaderPack;
+import net.nvidium.shaders.pack.ShaderPackManager;
+import net.nvidium.shaders.pipeline.gbuffer.GBuffer;
 import net.nvidium.shaders.pipeline.gl.FullscreenQuad;
 import net.nvidium.shaders.pipeline.gl.ShaderProgram;
+import net.nvidium.shaders.pipeline.targets.HdrTargets;
+import net.nvidium.shaders.pipeline.targets.SceneCopyTargets;
+import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
+import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL13C;
-import org.lwjgl.opengl.GL20C;
 import org.lwjgl.opengl.GL30C;
+import org.lwjgl.opengl.GL45C;
 
 /**
- * Post-Processing Pass.
- * Applies HDR Bloom, Auto-Exposure, ACES/AgX Film Tone Mapping,
- * and outputs the final color to Minecraft's main display framebuffer.
+ * Two-phase post-processing pass:
+ * <ol>
+ *   <li>{@link #execute(RenderContext)}: Resolves HDR Deferred Lighting + Volumetric Fog + Multi-Mip Bloom +
+ *       Temporal Accumulation (TAA) + AgX/ACES Tonemapping into history buffer and blits to {@code mcTarget}
+ *       so entities and translucent geometry render over the lit scene.</li>
+ *   <li>{@link #executeFinalComposite(RenderContext)}: Runs after translucent water/glass to apply
+ *       underwater lens distortion/caustics, FXAA, and Contrast Adaptive Sharpening (CAS).</li>
+ * </ol>
  */
 public class PostProcessPass implements IShaderPass {
+    private final GBuffer gBuffer;
+    private final HdrTargets hdrTargets;
+    private final SceneCopyTargets sceneCopyTargets;
+    private final SceneUniforms sceneUniforms;
+    private final PackOptionsUniforms packOptionsUniforms;
+
+    private ShaderProgram tonemapBloomProgram;
+    private ShaderProgram finalCompositeProgram;
     private boolean enabled = true;
-    private ShaderProgram tonemapShader;
+
+    public PostProcessPass(
+            GBuffer gBuffer,
+            HdrTargets hdrTargets,
+            SceneCopyTargets sceneCopyTargets,
+            SceneUniforms sceneUniforms,
+            PackOptionsUniforms packOptionsUniforms) {
+        this.gBuffer = gBuffer;
+        this.hdrTargets = hdrTargets;
+        this.sceneCopyTargets = sceneCopyTargets;
+        this.sceneUniforms = sceneUniforms;
+        this.packOptionsUniforms = packOptionsUniforms;
+    }
 
     @Override
-    public String getId() {
-        return "post_process";
+    public void init() {
+        ShaderPack pack = ShaderPackManager.get().getActivePack();
+        this.tonemapBloomProgram = ShaderProgram.createFullscreenStage(pack, "post");
+        this.finalCompositeProgram = ShaderProgram.createFullscreenStage(pack, "final");
+    }
+
+    @Override
+    public void execute(RenderContext ctx) {
+        if (!enabled || tonemapBloomProgram == null) return;
+
+        int w = ctx.getScreenWidth();
+        int h = ctx.getScreenHeight();
+        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+
+        // Generate hardware mip pyramid on HDR scene texture for wide multi-octave bloom
+        hdrTargets.generateSceneMipmaps();
+
+        int writeFbo = hdrTargets.getCurrentHistoryWriteFbo();
+        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, writeFbo);
+        GL11C.glViewport(0, 0, w, h);
+
+        GL11C.glDisable(GL11C.GL_DEPTH_TEST);
+        GL11C.glDepthMask(false);
+        GL11C.glDisable(GL11C.GL_BLEND);
+
+        sceneUniforms.bindStandard();
+        packOptionsUniforms.bindStandard();
+
+        tonemapBloomProgram.bind();
+
+        GL45C.glBindTextureUnit(0, hdrTargets.getSceneTex());
+        GL45C.glBindTextureUnit(1, hdrTargets.getFogTex());
+        GL45C.glBindTextureUnit(2, gBuffer.getLightEmissionTex());
+        GL45C.glBindTextureUnit(3, mcTarget.getDepthTextureId());
+        GL45C.glBindTextureUnit(4, hdrTargets.getPreviousHistoryReadTex());
+        GL45C.glBindTextureUnit(5, gBuffer.getNormalMetallicTex());
+
+        FullscreenQuad.render();
+
+        tonemapBloomProgram.unbind();
+
+        // Blit resolved color to Minecraft's main render target while preserving terrain depth in mcTarget
+        GL45C.glBlitNamedFramebuffer(
+                writeFbo,
+                mcTarget.frameBufferId,
+                0, 0, w, h,
+                0, 0, w, h,
+                GL11C.GL_COLOR_BUFFER_BIT,
+                GL11C.GL_NEAREST
+        );
+
+        hdrTargets.swapHistory();
+
+        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, mcTarget.frameBufferId);
+        GL11C.glDepthMask(true);
+        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
+        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
+        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+    }
+
+    public void executeFinalComposite(RenderContext ctx) {
+        if (!enabled || finalCompositeProgram == null) return;
+
+        int w = ctx.getScreenWidth();
+        int h = ctx.getScreenHeight();
+        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+
+        // Copy current mcTarget color (including entities & translucent water/glass) to sceneCopyTargets
+        sceneCopyTargets.copyFromFbo(mcTarget.frameBufferId, mcTarget.getDepthTextureId(), true, false, false);
+
+        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, mcTarget.frameBufferId);
+        GL11C.glViewport(0, 0, w, h);
+
+        GL11C.glDisable(GL11C.GL_DEPTH_TEST);
+        GL11C.glDepthMask(false);
+        GL11C.glDisable(GL11C.GL_BLEND);
+
+        sceneUniforms.bindStandard();
+        packOptionsUniforms.bindStandard();
+
+        finalCompositeProgram.bind();
+
+        GL45C.glBindTextureUnit(0, sceneCopyTargets.getColorCopyTex());
+        GL45C.glBindTextureUnit(1, mcTarget.getDepthTextureId());
+        GL45C.glBindTextureUnit(2, gBuffer.getNormalMetallicTex());
+        GL45C.glBindTextureUnit(3, gBuffer.getLightEmissionTex());
+
+        FullscreenQuad.render();
+
+        finalCompositeProgram.unbind();
+
+        GL11C.glDepthMask(true);
+        Gl11RestoreState();
+    }
+
+    private void Gl11RestoreState() {
+        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
+        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+    }
+
+    @Override
+    public void resize(int width, int height) {
+    }
+
+    @Override
+    public void destroy() {
+        if (tonemapBloomProgram != null) {
+            tonemapBloomProgram.delete();
+            tonemapBloomProgram = null;
+        }
+        if (finalCompositeProgram != null) {
+            finalCompositeProgram.delete();
+            finalCompositeProgram = null;
+        }
+    }
+
+    @Override
+    public String getName() {
+        return "PostProcessPass";
     }
 
     @Override
@@ -31,96 +178,7 @@ public class PostProcessPass implements IShaderPass {
         return enabled;
     }
 
-    @Override
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
-    }
-
-    @Override
-    public void init(PipelineManager pipeline) {
-        reload();
-    }
-
-    @Override
-    public void execute(PipelineManager pipeline, RenderContext context) {
-        if (!enabled) return;
-
-        DeferredLightingPass lightingPass = (DeferredLightingPass) pipeline.getPass("deferred_lighting");
-        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
-        int targetFbo = mcTarget != null ? mcTarget.frameBufferId : 0;
-        int width = pipeline.getWidth();
-        int height = pipeline.getHeight();
-
-        // 1. If G-Buffer is using a separate depth buffer from mcTarget, copy depth
-        // When G-Buffer attaches mcTarget's depth buffer directly, mcTarget already has the terrain depth!
-        if (mcTarget != null && pipeline.getGbuffer().getDepthTex() != mcTarget.getDepthTextureId()) {
-            GL30C.glBindFramebuffer(GL30C.GL_READ_FRAMEBUFFER, pipeline.getGbuffer().getFboId());
-            GL30C.glBindFramebuffer(GL30C.GL_DRAW_FRAMEBUFFER, targetFbo);
-            GL30C.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL11C.GL_DEPTH_BUFFER_BIT, GL11C.GL_NEAREST);
-        }
-
-        // 2. Render lit color into Minecraft's mainRenderTarget
-        if (mcTarget != null) {
-            mcTarget.bindWrite(true);
-        } else {
-            GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, 0);
-            GL11C.glViewport(0, 0, width, height);
-        }
-
-        GL11C.glDisable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthMask(false);
-        GL11C.glDisable(GL11C.GL_BLEND);
-
-        if (tonemapShader != null && lightingPass != null) {
-            tonemapShader.bind();
-
-            // Bind HDR Color texture: Unit 0
-            GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
-            GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, lightingPass.getHdrColorTexture());
-            tonemapShader.setUniform1i("u_HdrColorTexture", 0);
-
-            FullscreenQuad.render();
-            ShaderProgram.unbind();
-        } else {
-            // Robust Fallback: Blit HDR FBO (or G-Buffer Attachment 0) directly
-            int sourceFbo = (lightingPass != null && lightingPass.getHdrFbo() != 0)
-                    ? lightingPass.getHdrFbo()
-                    : pipeline.getGbuffer().getFboId();
-            GL30C.glBindFramebuffer(GL30C.GL_READ_FRAMEBUFFER, sourceFbo);
-            GL30C.glBindFramebuffer(GL30C.GL_DRAW_FRAMEBUFFER, targetFbo);
-            GL30C.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL11C.GL_COLOR_BUFFER_BIT, GL11C.GL_NEAREST);
-        }
-
-        // Restore OpenGL state for Minecraft's entity/translucent rendering
-        if (mcTarget != null) {
-            mcTarget.bindWrite(false);
-        }
-        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
-        GL11C.glDepthMask(true);
-    }
-
-    @Override
-    public void resize(int width, int height) {}
-
-    @Override
-    public void reload() {
-        try {
-            if (tonemapShader != null) tonemapShader.destroy();
-            tonemapShader = new ShaderProgram("PostProcess")
-                    .attachStage(GL20C.GL_VERTEX_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/common/fullscreen.vert"))
-                    .attachStage(GL20C.GL_FRAGMENT_SHADER, ResourceLocation.fromNamespaceAndPath(NvidiumShaderPipeline.MOD_ID, "shaders/post/tonemap_bloom.frag"))
-                    .link();
-        } catch (Exception e) {
-            NvidiumShaderPipeline.LOGGER.error("Failed to compile PostProcess shader", e);
-        }
-    }
-
-    @Override
-    public void destroy() {
-        if (tonemapShader != null) {
-            tonemapShader.destroy();
-            tonemapShader = null;
-        }
     }
 }

@@ -1,0 +1,196 @@
+{
+  "name": "Nvidium Frontier Default",
+  "description": "Physically-based mesh-shader deferred pipeline featuring per-block material shading, 3-cascade sun/moon shadows, Horizon GTAO, volumetric light shafts & clouds, Gerstner water with caustics & SSR, dynamic handheld lighting, rain puddles, TAA, and AgX/ACES tonemapping.",
+  "author": "Nvidium Team",
+  "version": "2.0.0",
+  "stages": {
+    "terrain": "gbuffer/terrain_gbuffer.frag",
+    "shadow": "shadow/shadow.frag",
+    "deferred": "deferred/deferred_lighting.frag",
+    "fog": "deferred/volumetric_fog.frag",
+    "translucent": "water/water_surface.frag",
+    "post": "post/tonemap_bloom.frag",
+    "final": "post/final_composite.frag",
+    "fullscreen_vert": "common/fullscreen.vert"
+  },
+  "options": [
+    {
+      "id": "SUNLIGHT_INTENSITY",
+      "name": "Sunlight Intensity",
+      "description": "Direct sun and moon directional illuminance multiplier",
+      "category": "Lighting",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.2,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 0
+    },
+    {
+      "id": "AMBIENT_INTENSITY",
+      "name": "Sky Ambient Intensity",
+      "description": "Hemispherical sky and indirect ground-bounce ambient brightness",
+      "category": "Lighting",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.25,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 1
+    },
+    {
+      "id": "EMISSIVE_STRENGTH",
+      "name": "Emissive Block Glow",
+      "description": "HDR luminance multiplier for torches, lanterns, lava, glowstone, sculk, and glowing ores",
+      "category": "Lighting",
+      "type": "float",
+      "default": 1.25,
+      "min": 0.2,
+      "max": 3.5,
+      "step": 0.05,
+      "slot": 2
+    },
+    {
+      "id": "HANDHELD_DYNAMIC_LIGHT",
+      "name": "Handheld Dynamic Light",
+      "description": "Casts colored point light from held torches, soul lanterns, lava buckets, and glowing items",
+      "category": "Lighting",
+      "type": "bool",
+      "default": 1.0,
+      "slot": 3
+    },
+    {
+      "id": "CLOUD_MODE",
+      "name": "Clouds Style",
+      "description": "Selects sky cloud rendering mode",
+      "category": "Atmosphere",
+      "type": "enum",
+      "default": 2.0,
+      "choices": ["Off", "2D Cirrus", "Volumetric Multi-Layer"],
+      "slot": 4
+    },
+    {
+      "id": "CLOUD_COVERAGE",
+      "name": "Cloud Coverage",
+      "description": "Fraction of sky covered by dynamic clouds (automatically increases during rain)",
+      "category": "Atmosphere",
+      "type": "float",
+      "default": 0.52,
+      "min": 0.0,
+      "max": 1.0,
+      "step": 0.05,
+      "slot": 5
+    },
+    {
+      "id": "GODRAYS_STRENGTH",
+      "name": "Volumetric Godrays",
+      "description": "Intensity of raymarched crepuscular sun/moon light shafts",
+      "category": "Atmosphere",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 6
+    },
+    {
+      "id": "ATMOS_HAZINESS",
+      "name": "Atmospheric Haziness",
+      "description": "Controls aerial perspective and Mie forward scattering haze",
+      "category": "Atmosphere",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 7
+    },
+    {
+      "id": "WATER_WAVE_HEIGHT",
+      "name": "Water Wave Amplitude",
+      "description": "Gerstner surface wave height and normal perturbation strength",
+      "category": "Water & Materials",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 8
+    },
+    {
+      "id": "WATER_CLARITY",
+      "name": "Water Clarity",
+      "description": "Controls underwater Beer-Lambert absorption depth and clarity",
+      "category": "Water & Materials",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.2,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 9
+    },
+    {
+      "id": "WATER_CAUSTICS",
+      "name": "Underwater Caustics",
+      "description": "Animated refractive light patterns projected onto underwater seabed surfaces",
+      "category": "Water & Materials",
+      "type": "bool",
+      "default": 1.0,
+      "slot": 10
+    },
+    {
+      "id": "RAIN_PUDDLES",
+      "name": "Rain Wetness & Puddles",
+      "description": "Dynamic reflective puddles and porous darkening on outdoor surfaces during rain",
+      "category": "Water & Materials",
+      "type": "bool",
+      "default": 1.0,
+      "slot": 11
+    },
+    {
+      "id": "SUBSURFACE_SCATTERING",
+      "name": "Subsurface Scattering",
+      "description": "Transmitted sunlight wrap and translucency through foliage, leaves, ice, and snow",
+      "category": "Water & Materials",
+      "type": "bool",
+      "default": 1.0,
+      "slot": 12
+    },
+    {
+      "id": "NORMAL_BUMP_STRENGTH",
+      "name": "Surface Relief / Bump",
+      "description": "Strength of LabPBR and micro-surface relief normal mapping",
+      "category": "Water & Materials",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 2.0,
+      "step": 0.05,
+      "slot": 13
+    },
+    {
+      "id": "WIND_SPEED",
+      "name": "Foliage Wind Speed",
+      "description": "Speed and amplitude of waving grass, crops, vines, and leaves",
+      "category": "Water & Materials",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.0,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 14
+    },
+    {
+      "id": "SHADOW_SOFTNESS",
+      "name": "Shadow Penumbra Softness",
+      "description": "Vogel-disk PCF filter radius for sun and moon shadows",
+      "category": "Lighting",
+      "type": "float",
+      "default": 1.0,
+      "min": 0.25,
+      "max": 2.5,
+      "step": 0.05,
+      "slot": 15
+    }
+  ]
+}

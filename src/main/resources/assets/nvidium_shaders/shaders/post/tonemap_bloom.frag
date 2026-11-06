@@ -1,112 +1,143 @@
 #version 460 core
 
-// ============================================================================
-// Nvidium Shader Pipeline (NSP) - Phase 6: Post-Process, Bloom & Tonemapping
-// Soft-knee highlight extraction, 4-octave radial bloom, exposure scaling,
-// ACES Filmic tonemapping, and linear-to-sRGB gamma conversion.
-// ============================================================================
+in vec2 v_TexCoord;
+layout(location = 0) out vec4 outColor;
 
-layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;
-    mat4  u_ProjMatrix;
-    mat4  u_ViewProjMatrix;
-    mat4  u_InvViewProjMatrix;
-    mat4  u_CascadeViewProj[3];
-    vec4  u_CascadeSplits;
-    vec4  u_SunDirection;
-    vec4  u_SunColor;
-    vec4  u_AmbientColor;
-    vec4  u_CameraPos;
-    vec2  u_ScreenSize;
-    vec2  _pad0;
-    float u_Time;
-    int   u_FrameIndex;
-    float u_FogStart;
-    float u_FogEnd;
-    vec4  u_FogColor;
-};
+#include "../common/scene_uniforms.glsl"
+#include "../common/options.glsl"
+#include "../common/post_tonemap.glsl"
 
-layout(binding = 0) uniform sampler2D u_HdrColorTexture;
+layout(binding = 0) uniform sampler2D hdrSceneTex;      // Mip-mapped HDR scene texture
+layout(binding = 1) uniform sampler2D volumetricFogTex; // RGBA16F (rgb=inscatter, a=transmittance)
+layout(binding = 2) uniform sampler2D gLightEmission;
+layout(binding = 3) uniform sampler2D gDepth;
+layout(binding = 4) uniform sampler2D prevHistoryTex;   // Previous frame's resolved output for TAA
+layout(binding = 5) uniform sampler2D gNormalMetallic;
 
-layout(location = 0) in vec2 v_Uv;
-layout(location = 0) out vec4 outSrgbColor;
-
-const float BLOOM_THRESHOLD = 1.1;
-const float BLOOM_KNEE      = 0.5;
-const float BLOOM_INTENSITY = 0.18;
-const float EXPOSURE        = 1.08;
-
-// ----------------------------------------------------------------------------
-// Requirement 2: Extract bright highlights exceeding threshold 1.1 with smooth knee 0.5
-// ----------------------------------------------------------------------------
-vec3 extractBrightHighlights(vec3 color) {
-    float brightness = max(color.r, max(color.g, color.b));
-    float soft = brightness - BLOOM_THRESHOLD + BLOOM_KNEE;
-    soft = clamp(soft, 0.0, 2.0 * BLOOM_KNEE);
-    soft = (soft * soft) / (4.0 * BLOOM_KNEE + 1e-5);
-    float contribution = max(soft, brightness - BLOOM_THRESHOLD) / max(brightness, 1e-5);
-    return max(color * contribution, vec3(0.0));
+vec3 softBloomThreshold(vec3 color, float threshold, float knee) {
+    float br = max(color.r, max(color.g, color.b));
+    float soft = clamp(br - threshold + knee, 0.0, 2.0 * knee);
+    soft = (soft * soft) / max(4.0 * knee, 1.0e-5);
+    float contrib = max(soft, br - threshold) / max(br, 1.0e-4);
+    return color * clamp(contrib, 0.0, 1.0);
 }
 
-// ----------------------------------------------------------------------------
-// Requirement 3: Multi-octave radial blur (radii 1.5, 3.5, 7.5, 14.0 texels)
-// ----------------------------------------------------------------------------
-vec3 sampleBloomOctave(vec2 uv, vec2 texelSize, float radiusTexels) {
-    const vec2 dirs[8] = vec2[8](
-        vec2( 1.0,  0.0),
-        vec2(-1.0,  0.0),
-        vec2( 0.0,  1.0),
-        vec2( 0.0, -1.0),
-        vec2( 0.70710678,  0.70710678),
-        vec2(-0.70710678,  0.70710678),
-        vec2( 0.70710678, -0.70710678),
-        vec2(-0.70710678, -0.70710678)
-    );
-
-    vec2 stepUv = texelSize * radiusTexels;
-    vec3 acc = extractBrightHighlights(texture(u_HdrColorTexture, uv).rgb) * 0.20;
-
-    for (int i = 0; i < 8; ++i) {
-        vec2 sampleUv = clamp(uv + dirs[i] * stepUv, vec2(0.001), vec2(0.999));
-        acc += extractBrightHighlights(texture(u_HdrColorTexture, sampleUv).rgb) * 0.10;
-    }
-    return acc;
+vec3 sampleTentMip(int mipLevel, vec2 uv, vec2 radiusUV) {
+    float lod = float(mipLevel);
+    vec3 c  = textureLod(hdrSceneTex, uv, lod).rgb * 4.0;
+    c += textureLod(hdrSceneTex, uv + vec2(-radiusUV.x,  0.0), lod).rgb * 2.0;
+    c += textureLod(hdrSceneTex, uv + vec2( radiusUV.x,  0.0), lod).rgb * 2.0;
+    c += textureLod(hdrSceneTex, uv + vec2( 0.0, -radiusUV.y), lod).rgb * 2.0;
+    c += textureLod(hdrSceneTex, uv + vec2( 0.0,  radiusUV.y), lod).rgb * 2.0;
+    c += textureLod(hdrSceneTex, uv + vec2(-radiusUV.x, -radiusUV.y), lod).rgb;
+    c += textureLod(hdrSceneTex, uv + vec2( radiusUV.x, -radiusUV.y), lod).rgb;
+    c += textureLod(hdrSceneTex, uv + vec2(-radiusUV.x,  radiusUV.y), lod).rgb;
+    c += textureLod(hdrSceneTex, uv + vec2( radiusUV.x,  radiusUV.y), lod).rgb;
+    return softBloomThreshold(c * (1.0 / 16.0), 0.95, 0.55);
 }
 
 vec3 computeMultiOctaveBloom(vec2 uv) {
-    vec2 texelSize = 1.0 / max(u_ScreenSize, vec2(1.0));
-    vec3 octave0 = sampleBloomOctave(uv, texelSize, 1.5);
-    vec3 octave1 = sampleBloomOctave(uv, texelSize, 3.5);
-    vec3 octave2 = sampleBloomOctave(uv, texelSize, 7.5);
-    vec3 octave3 = sampleBloomOctave(uv, texelSize, 14.0);
-
-    return octave0 * 0.35 + octave1 * 0.30 + octave2 * 0.20 + octave3 * 0.15;
+    vec2 baseTexel = u_ScreenSize.zw;
+    vec3 b1 = sampleTentMip(1, uv, baseTexel * 2.5);
+    vec3 b2 = sampleTentMip(2, uv, baseTexel * 5.0);
+    vec3 b3 = sampleTentMip(3, uv, baseTexel * 10.0);
+    vec3 b4 = sampleTentMip(4, uv, baseTexel * 20.0);
+    vec3 b5 = sampleTentMip(5, uv, baseTexel * 38.0);
+    return (b1 * 0.30 + b2 * 0.26 + b3 * 0.20 + b4 * 0.14 + b5 * 0.10);
 }
 
-// ----------------------------------------------------------------------------
-// Requirement 5: ACES Filmic Tonemapping Curve
-// ----------------------------------------------------------------------------
-vec3 acesFilmic(vec3 x) {
-    return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+vec3 rgbToYCoCg(vec3 c) {
+    return vec3(
+         0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+         0.50 * c.r             - 0.50 * c.b,
+        -0.25 * c.r + 0.5 * c.g - 0.25 * c.b
+    );
+}
+
+vec3 yCoCgToRgb(vec3 ycc) {
+    float y  = ycc.x;
+    float co = ycc.y;
+    float cg = ycc.z;
+    return vec3(y + co - cg, y + cg, y - co - cg);
+}
+
+vec3 resolveCurrentPixelSrgb(vec2 uv, vec3 precomputedBloom) {
+    vec3 hdr = textureLod(hdrSceneTex, uv, 0.0).rgb;
+    vec4 volFog = textureLod(volumetricFogTex, uv, 0.0);
+    hdr = hdr * volFog.a + volFog.rgb;
+
+    float bloomStrength = u_PostParams.y;
+    if (bloomStrength > 0.001) {
+        hdr += precomputedBloom * bloomStrength;
+    }
+
+    float exposure = u_PostParams.x;
+    float saturation = u_PostParams.z;
+    int tonemapOp = int(round(u_PostParams.w));
+
+    vec3 graded = applyColorGrading(hdr * exposure, saturation);
+    vec3 mappedLinear = applySelectedTonemap(graded, tonemapOp);
+    return linearToSrgb(mappedLinear);
 }
 
 void main() {
-    // Requirement 1: Sample u_HdrColorTexture at v_Uv
-    vec3 hdrColor = texture(u_HdrColorTexture, v_Uv).rgb;
+    float bloomStrength = u_PostParams.y;
+    vec3 bloom = (bloomStrength > 0.001) ? computeMultiOctaveBloom(v_TexCoord) : vec3(0.0);
 
-    // Requirement 2 & 3: Highlight extraction & 4-octave radial bloom
-    vec3 bloom = computeMultiOctaveBloom(v_Uv);
-    hdrColor += bloom * BLOOM_INTENSITY;
+    vec3 currSrgb = resolveCurrentPixelSrgb(v_TexCoord, bloom);
 
-    // Requirement 4: Exposure scaling
-    vec3 exposed = hdrColor * EXPOSURE;
+    // Debug modes bypass TAA
+    if (u_DebugParams.x > 0.5) {
+        outColor = vec4(currSrgb, 1.0);
+        return;
+    }
 
-    // Requirement 5: ACES Filmic tonemapping
-    vec3 tonemapped = acesFilmic(exposed);
+    // Temporal Accumulation / Anti-Aliasing (TAA) with 3x3 YCoCg Variance Clipping
+    bool taaEnabled = (u_DebugParams.y > 0.5) && (u_CameraDelta.w > 0.5);
+    if (taaEnabled) {
+        float depth = textureLod(gDepth, v_TexCoord, 0.0).r;
+        vec3 camRelPos = reconstructCameraRelativePos(v_TexCoord, depth);
 
-    // Requirement 6: Convert output to sRGB gamma (pow 1.0 / 2.2)
-    vec3 srgbColor = pow(max(tonemapped, vec3(0.0)), vec3(1.0 / 2.2));
+        // Convert current camera-relative pos to previous frame's camera-relative origin
+        vec3 prevCamRelPos = (depth >= 0.99999) ? camRelPos : (camRelPos + u_CameraDelta.xyz);
+        vec4 prevClip = u_PrevViewProjMatrix * vec4(prevCamRelPos, 1.0);
 
-    // Requirement 7: Output RGBA in outSrgbColor
-    outSrgbColor = vec4(srgbColor, 1.0);
+        if (prevClip.w > 1.0e-5) {
+            vec2 prevUV = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+            if (prevUV.x > 0.001 && prevUV.x < 0.999 && prevUV.y > 0.001 && prevUV.y < 0.999) {
+                vec3 historySrgb = textureLod(prevHistoryTex, prevUV, 0.0).rgb;
+
+                // Sample 3x3 cross neighborhood in current frame to build YCoCg variance box
+                vec2 texel = u_ScreenSize.zw;
+                vec3 c0 = rgbToYCoCg(currSrgb);
+                vec3 cN = rgbToYCoCg(resolveCurrentPixelSrgb(v_TexCoord + vec2( 0.0,  texel.y), bloom));
+                vec3 cS = rgbToYCoCg(resolveCurrentPixelSrgb(v_TexCoord + vec2( 0.0, -texel.y), bloom));
+                vec3 cE = rgbToYCoCg(resolveCurrentPixelSrgb(v_TexCoord + vec2( texel.x, 0.0), bloom));
+                vec3 cW = rgbToYCoCg(resolveCurrentPixelSrgb(v_TexCoord + vec2(-texel.x, 0.0), bloom));
+
+                vec3 m1 = (c0 + cN + cS + cE + cW) * 0.2;
+                vec3 m2 = (c0 * c0 + cN * cN + cS * cS + cE * cE + cW * cW) * 0.2;
+                vec3 sigma = sqrt(max(m2 - m1 * m1, vec3(1.0e-6)));
+
+                float motionPixels = length((prevUV - v_TexCoord) * u_ScreenSize.xy);
+                float gammaBox = mix(1.35, 0.80, clamp(motionPixels / 12.0, 0.0, 1.0));
+
+                vec3 boxMin = m1 - gammaBox * sigma;
+                vec3 boxMax = m1 + gammaBox * sigma;
+
+                vec3 histYcc = clamp(rgbToYCoCg(historySrgb), boxMin, boxMax);
+                vec3 clampedHistory = clamp(yCoCgToRgb(histYcc), 0.0, 1.0);
+
+                float blendWeight = mix(0.86, 0.62, clamp(motionPixels / 16.0, 0.0, 1.0));
+                currSrgb = mix(currSrgb, clampedHistory, blendWeight);
+            }
+        }
+    }
+
+    // Subtle filmic vignette
+    vec2 vigUV = v_TexCoord * (1.0 - v_TexCoord.yx);
+    float vig = pow(clamp(vigUV.x * vigUV.y * 16.0, 0.0, 1.0), 0.12);
+    currSrgb *= mix(0.90, 1.0, vig);
+
+    outColor = vec4(clamp(currSrgb, 0.0, 1.0), 1.0);
 }

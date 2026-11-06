@@ -1,184 +1,99 @@
 package net.nvidium.shaders.integration;
 
-import com.mojang.blaze3d.platform.GlStateManager;
 import me.cortex.nvidium.api0.INvidiumShaderHook;
 import me.cortex.nvidium.gl.shader.Shader;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.render.viewport.Viewport;
-import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.resources.ResourceLocation;
-import net.nvidium.shaders.NvidiumShaderPipeline;
+import net.minecraft.client.gui.screens.Screen;
+import net.nvidium.shaders.config.PipelineConfig;
+import net.nvidium.shaders.gui.NvidiumShaderScreen;
 import net.nvidium.shaders.pipeline.PipelineManager;
-import net.nvidium.shaders.pipeline.passes.DeferredLightingPass;
-import net.nvidium.shaders.pipeline.passes.PostProcessPass;
 import net.nvidium.shaders.pipeline.passes.RenderContext;
-import net.nvidium.shaders.pipeline.passes.VolumetricFogPass;
-import net.nvidium.shaders.pipeline.passes.WaterTranslucentPass;
-import org.joml.Matrix4f;
-import org.lwjgl.opengl.GL11C;
-import org.lwjgl.opengl.GL30C;
 
 /**
- * Concrete implementation connecting Nvidium's GPU rendering engine
- * to the Nvidium Shader Pipeline (NSP).
+ * Concrete implementation of {@link INvidiumShaderHook} bridging Nvidium's mesh-shader
+ * terrain/translucent/shadow rendering with the Nvidium Deferred Shader Pipeline.
  */
 public class NvidiumHookImpl implements INvidiumShaderHook {
-    private final PipelineManager pipeline;
-    private RenderContext currentContext;
-    private int frameIndex = 0;
-    private float totalTime = 0.0f;
 
-    public NvidiumHookImpl(PipelineManager pipeline) {
-        this.pipeline = pipeline;
-    }
+    private final RenderContext currentContext = new RenderContext();
 
     @Override
     public void onSetupFrame(Viewport viewport, ChunkRenderMatrices crm, double px, double py, double pz) {
-        if (!pipeline.isEnabled()) return;
+        if (!PipelineConfig.get().enabled) return;
 
-        Minecraft mc = Minecraft.getInstance();
-        ClientLevel level = mc.level;
-        Camera camera = mc.gameRenderer.getMainCamera();
-        int width = mc.getWindow().getWidth();
-        int height = mc.getWindow().getHeight();
+        int width = Minecraft.getInstance().getWindow().getWidth();
+        int height = Minecraft.getInstance().getWindow().getHeight();
 
-        float tickDelta = mc.getTimer().getGameTimeDeltaPartialTick(true);
-        totalTime += tickDelta / 20.0f;
-        frameIndex++;
+        currentContext.updateFrame(viewport, crm, px, py, pz, width, height);
+        PipelineManager.getInstance().onFrameSetup(currentContext);
+    }
 
-        Matrix4f proj = new Matrix4f(crm.projection());
-        Matrix4f view = new Matrix4f(crm.modelView());
-
-        this.currentContext = new RenderContext(
-                proj,
-                view,
-                camera,
-                level,
-                width,
-                height,
-                tickDelta,
-                totalTime,
-                frameIndex
-        );
-
-        // Check for resize
-        if (width != pipeline.getWidth() || height != pipeline.getHeight()) {
-            pipeline.resize(width, height);
-        }
-
-        // 1. Update global scene uniforms UBO
-        pipeline.getSceneUniforms().update(
-                proj,
-                view,
-                camera,
-                pipeline.getShadowMap(),
-                level,
-                width,
-                height,
-                totalTime,
-                frameIndex
-        );
-
-        // 2. Update and evaluate Cascaded Shadow Map
-        pipeline.getShadowMap().update(camera, level, tickDelta);
+    @Override
+    public void onShadowPass(ShadowPassContext shadowContext) {
+        if (!PipelineConfig.get().enabled) return;
+        PipelineManager.getInstance().executeShadowPass(shadowContext, currentContext);
     }
 
     @Override
     public void onPreRenderTerrain(int regionCount, long commandAddr) {
-        if (!pipeline.isEnabled()) return;
-
-        // Bind G-Buffer Multiple Render Targets (MRT)
-        pipeline.getGbuffer().bindWrite();
-        pipeline.getGbuffer().clear();
-
-        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
-        GL11C.glDepthMask(true);
+        if (!PipelineConfig.get().enabled) return;
+        currentContext.updateTerrainBuffer(regionCount, commandAddr);
+        PipelineManager.getInstance().executePreTerrain(currentContext);
     }
 
     @Override
     public void onBindTerrainTextures() {
-        if (!pipeline.isEnabled()) return;
-
-        Minecraft mc = Minecraft.getInstance();
-        var rm = mc.getResourceManager();
-        // Bind LabPBR Normal Atlas (unit 2) and Specular Atlas (unit 3) only if actually present
-        try {
-            var normalLoc = ResourceLocation.parse("textures/atlas/blocks_n.png");
-            if (rm.getResource(normalLoc).isPresent()) {
-                var normalTex = mc.getTextureManager().getTexture(normalLoc);
-                if (normalTex != null) {
-                    GlStateManager._activeTexture(33984 + 2); // GL_TEXTURE2
-                    GlStateManager._bindTexture(normalTex.getId());
-                }
-            }
-            var specLoc = ResourceLocation.parse("textures/atlas/blocks_s.png");
-            if (rm.getResource(specLoc).isPresent()) {
-                var specTex = mc.getTextureManager().getTexture(specLoc);
-                if (specTex != null) {
-                    GlStateManager._activeTexture(33984 + 3); // GL_TEXTURE3
-                    GlStateManager._bindTexture(specTex.getId());
-                }
-            }
-        } catch (Exception ignored) {}
-    }
-
-    @Override
-    public void onPostRenderTerrain() {
-        if (!pipeline.isEnabled() || currentContext == null) return;
-
-        // 1. Execute Deferred Lighting Pass (Cook-Torrance GGX + Cascaded Shadows)
-        var lightingPass = (DeferredLightingPass) pipeline.getPass("deferred_lighting");
-        if (lightingPass != null && lightingPass.isEnabled()) {
-            lightingPass.execute(pipeline, currentContext);
-        }
-
-        // 2. Execute Volumetric Fog Pass (Raymarched sun shafts)
-        var fogPass = (VolumetricFogPass) pipeline.getPass("volumetric_fog");
-        if (fogPass != null && fogPass.isEnabled()) {
-            fogPass.execute(pipeline, currentContext);
-        }
-
-        // 3. Resolve Lit Scene & Copy Depth to Minecraft's mainRenderTarget
-        // This ensures the terrain is fully visible and entities depth-test properly against it
-        var postPass = (PostProcessPass) pipeline.getPass("post_process");
-        if (postPass != null && postPass.isEnabled()) {
-            postPass.execute(pipeline, currentContext);
-        }
-    }
-
-    @Override
-    public void onPreRenderTranslucent(int regionCount, long commandAddr) {
-        if (!pipeline.isEnabled()) return;
-
-        // Ensure Minecraft's mainRenderTarget is bound for translucent chunk rasterization
-        var mcTarget = Minecraft.getInstance().getMainRenderTarget();
-        if (mcTarget != null) {
-            mcTarget.bindWrite(false);
-        }
-        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
-        GL11C.glDepthMask(false);
-    }
-
-    @Override
-    public void onPostRenderTranslucent() {
-        if (!pipeline.isEnabled() || currentContext == null) return;
-
-        // Execute Water Surface Shading if enabled
-        var waterPass = (WaterTranslucentPass) pipeline.getPass("water_translucent");
-        if (waterPass != null && waterPass.isEnabled()) {
-            waterPass.execute(pipeline, currentContext);
-        }
-
-        GL11C.glDepthMask(true);
+        if (!PipelineConfig.get().enabled) return;
+        PipelineManager.getInstance().bindTerrainTextures();
     }
 
     @Override
     public Shader getCustomTerrainShader() {
-        // Can optionally supply custom G-Buffer shader instance here
-        return null;
+        if (!PipelineConfig.get().enabled) return null;
+        return PipelineManager.getInstance().getCustomTerrainShader();
+    }
+
+    @Override
+    public Shader getCustomTemporalTerrainShader() {
+        if (!PipelineConfig.get().enabled) return null;
+        return PipelineManager.getInstance().getCustomTemporalTerrainShader();
+    }
+
+    @Override
+    public void onPostRenderTerrain() {
+        if (!PipelineConfig.get().enabled) return;
+        PipelineManager.getInstance().executePostTerrain(currentContext);
+    }
+
+    @Override
+    public void onPreRenderTranslucent(int regionCount, long commandAddr) {
+        if (!PipelineConfig.get().enabled) return;
+        currentContext.updateTranslucentBuffer(regionCount, commandAddr);
+        PipelineManager.getInstance().executePreTranslucent(currentContext);
+    }
+
+    @Override
+    public Shader getCustomTranslucentShader() {
+        if (!PipelineConfig.get().enabled) return null;
+        return PipelineManager.getInstance().getCustomTranslucentShader();
+    }
+
+    @Override
+    public void onBindTranslucentTextures() {
+        if (!PipelineConfig.get().enabled) return;
+        PipelineManager.getInstance().bindTranslucentTextures();
+    }
+
+    @Override
+    public void onPostRenderTranslucent() {
+        if (!PipelineConfig.get().enabled) return;
+        PipelineManager.getInstance().executePostTranslucent(currentContext);
+    }
+
+    @Override
+    public Screen createShaderConfigScreen(Screen parent) {
+        return new NvidiumShaderScreen(parent);
     }
 }

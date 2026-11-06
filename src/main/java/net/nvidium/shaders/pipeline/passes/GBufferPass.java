@@ -1,18 +1,99 @@
 package net.nvidium.shaders.pipeline.passes;
 
-import net.nvidium.shaders.pipeline.PipelineManager;
-import org.lwjgl.opengl.GL11C;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.GlStateManager;
+import me.cortex.nvidium.gl.shader.Shader;
+import net.minecraft.client.Minecraft;
+import net.nvidium.shaders.pack.NvidiumShaderPrograms;
+import net.nvidium.shaders.pack.ShaderPack;
+import net.nvidium.shaders.pack.ShaderPackManager;
+import net.nvidium.shaders.pipeline.gbuffer.GBuffer;
+import net.nvidium.shaders.pipeline.textures.PbrAtlasHooks;
+import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
+import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
+import org.lwjgl.opengl.GL13C;
 
 /**
- * G-Buffer render pass.
- * Sets up Multiple Render Targets (MRT) to receive geometry output from Nvidium's mesh shaders.
+ * Binds the MRT G-Buffer FBO and provides Nvidium's mesh-shader terrain program
+ * ({@code task.glsl + mesh.glsl + terrain_gbuffer.frag}).
  */
 public class GBufferPass implements IShaderPass {
+    private final GBuffer gBuffer;
+    private final SceneUniforms sceneUniforms;
+    private final PackOptionsUniforms packOptionsUniforms;
+    private final PbrAtlasHooks pbrHooks;
+
+    private Shader customTerrainShader;
+    private Shader customTemporalTerrainShader;
     private boolean enabled = true;
 
+    public GBufferPass(
+            GBuffer gBuffer,
+            SceneUniforms sceneUniforms,
+            PackOptionsUniforms packOptionsUniforms,
+            PbrAtlasHooks pbrHooks) {
+        this.gBuffer = gBuffer;
+        this.sceneUniforms = sceneUniforms;
+        this.packOptionsUniforms = packOptionsUniforms;
+        this.pbrHooks = pbrHooks;
+    }
+
     @Override
-    public String getId() {
-        return "gbuffer";
+    public void init() {
+        ShaderPack pack = ShaderPackManager.get().getActivePack();
+        this.customTerrainShader = NvidiumShaderPrograms.compileTerrainGBufferShader(pack);
+        this.customTemporalTerrainShader = NvidiumShaderPrograms.compileTemporalTerrainGBufferShader(pack);
+    }
+
+    @Override
+    public void execute(RenderContext ctx) {
+        if (!enabled) return;
+
+        RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
+        gBuffer.bindForWriting(mcTarget.getDepthTextureId());
+        gBuffer.clearColorAttachments();
+
+        // Bind UBOs into NVIDIA Unified Memory address slots 3 and 4
+        sceneUniforms.bindUnified();
+        packOptionsUniforms.bindUnified();
+    }
+
+    public void bindLabPbrTextures() {
+        pbrHooks.bindPbrTextures(2, 3);
+        sceneUniforms.bindUnified();
+        packOptionsUniforms.bindUnified();
+        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
+        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+    }
+
+    public Shader getCustomTerrainShader() {
+        return enabled ? customTerrainShader : null;
+    }
+
+    public Shader getCustomTemporalTerrainShader() {
+        return enabled ? customTemporalTerrainShader : null;
+    }
+
+    @Override
+    public void resize(int width, int height) {
+        gBuffer.resize(width, height);
+    }
+
+    @Override
+    public void destroy() {
+        if (customTerrainShader != null) {
+            customTerrainShader.delete();
+            customTerrainShader = null;
+        }
+        if (customTemporalTerrainShader != null) {
+            customTemporalTerrainShader.delete();
+            customTemporalTerrainShader = null;
+        }
+    }
+
+    @Override
+    public String getName() {
+        return "GBufferPass";
     }
 
     @Override
@@ -20,35 +101,7 @@ public class GBufferPass implements IShaderPass {
         return enabled;
     }
 
-    @Override
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
     }
-
-    @Override
-    public void init(PipelineManager pipeline) {
-        // G-buffer FBO is owned by PipelineManager
-    }
-
-    @Override
-    public void execute(PipelineManager pipeline, RenderContext context) {
-        if (!enabled) return;
-
-        // Bind G-Buffer MRT for writing
-        pipeline.getGbuffer().bindWrite();
-        pipeline.getGbuffer().clear();
-
-        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-        GL11C.glDepthFunc(GL11C.GL_LEQUAL);
-        GL11C.glDepthMask(true);
-    }
-
-    @Override
-    public void resize(int width, int height) {}
-
-    @Override
-    public void reload() {}
-
-    @Override
-    public void destroy() {}
 }

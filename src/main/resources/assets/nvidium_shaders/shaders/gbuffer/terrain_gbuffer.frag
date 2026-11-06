@@ -1,95 +1,140 @@
 #version 460 core
+#extension GL_ARB_shading_language_include : enable
+#pragma optionNV(unroll all)
+#define UNROLL_LOOP
+#extension GL_NV_gpu_shader5 : require
+#extension GL_NV_bindless_texture : require
+#extension GL_NV_shader_buffer_load : require
+#extension GL_NV_fragment_shader_barycentric : require
 
-// ============================================================================
-// Nvidium Shader Pipeline (NSP) - Phase 1: Opaque Terrain G-Buffer Shader
-// Writes PBR material properties and lightmap channels to MRT attachments 0-2.
-// ============================================================================
+#import <nvidium:occlusion/scene.glsl>
+#import <nvidium:terrain/vertex_format.glsl>
 
-layout(std140, binding = 3) uniform SceneUniforms {
-    mat4  u_ViewMatrix;
-    mat4  u_ProjMatrix;
-    mat4  u_ViewProjMatrix;
-    mat4  u_InvViewProjMatrix;
-    mat4  u_CascadeViewProj[3];
-    vec4  u_CascadeSplits;
-    vec4  u_SunDirection;
-    vec4  u_SunColor;
-    vec4  u_AmbientColor;
-    vec4  u_CameraPos;
-    vec2  u_ScreenSize;
-    vec2  _pad0;
-    float u_Time;
-    int   u_FrameIndex;
-    float u_FogStart;
-    float u_FogEnd;
-    vec4  u_FogColor;
-};
+#include "../common/scene_uniforms.glsl"
+#include "../common/options.glsl"
+#include "../common/materials.glsl"
 
-layout(binding = 0) uniform sampler2D u_BlockAtlas;
+layout(location = 0) out vec4 outAlbedoRoughness; // RGB = Linear Albedo, A = Roughness
+layout(location = 1) out vec4 outNormalMetallic;  // RGB = World Normal, A = Packed(Metallic, MaterialId)
+layout(location = 2) out vec4 outLightEmission;   // R = BlockLight, G = SkyLight, B = Emissive, A = Vertex/Tex AO
 
-layout(location = 0) in vec3 v_WorldPos;
-layout(location = 1) in vec2 v_TexCoord;
-layout(location = 2) in vec4 v_VertexColor;
-layout(location = 3) in vec2 v_LightCoord;
-layout(location = 4) in vec3 v_Normal;
+layout(location = 5) in NvidiumVertexData {
+    vec2 v_uv;
+    vec3 v_color;
+    vec2 v_lightUV;
+} nv_in;
 
-layout(location = 0) out vec4 outAlbedoRoughness;
-layout(location = 1) out vec4 outNormalMetallic;
-layout(location = 2) out vec4 outLightEmission;
-
-float deriveRoughness(vec3 albedo, vec2 uv) {
-    float luma = dot(albedo, vec3(0.2126, 0.7152, 0.0722));
-    float chroma = max(albedo.r, max(albedo.g, albedo.b)) - min(albedo.r, min(albedo.g, albedo.b));
-    float baseRoughness = mix(0.88, 0.52, clamp(luma * 0.7 + chroma * 0.3, 0.0, 1.0));
-    return clamp(baseRoughness, 0.04, 1.0);
-}
-
-float deriveMetallic(vec3 albedo) {
-    float maxC = max(albedo.r, max(albedo.g, albedo.b));
-    float minC = min(albedo.r, min(albedo.g, albedo.b));
-    float saturation = (maxC > 0.001) ? ((maxC - minC) / maxC) : 0.0;
-    float brightness = dot(albedo, vec3(0.299, 0.587, 0.114));
-    return smoothstep(0.78, 0.96, brightness) * (1.0 - smoothstep(0.15, 0.45, saturation)) * 0.35;
-}
-
-float deriveEmission(vec3 albedo, float blockLight) {
-    float maxC = max(albedo.r, max(albedo.g, albedo.b));
-    float warmGlow = smoothstep(0.82, 0.99, maxC) * smoothstep(0.88, 0.99, blockLight);
-    return clamp(warmGlow, 0.0, 1.0);
-}
+layout(binding = 0) uniform sampler2D tex_diffuse;
+layout(binding = 1) uniform sampler2D tex_light;
+layout(binding = 2) uniform sampler2D tex_normal;   // LabPBR _n
+layout(binding = 3) uniform sampler2D tex_specular; // LabPBR _s
 
 void main() {
-    vec4 texSample = texture(u_BlockAtlas, v_TexCoord);
-    if (texSample.a < 0.1) {
+    uint quadId = uint(gl_PrimitiveID) >> 4;
+    bool triangle0 = ((uint(gl_PrimitiveID) >> 3) & 1u) == 0u;
+    uvec3 triIndices = triangle0 ? uvec3(0u, 1u, 2u) : uvec3(2u, 3u, 0u);
+
+    uint idx0 = (quadId << 2) + triIndices.x;
+    uint idx1 = (quadId << 2) + triIndices.y;
+    uint idx2 = (quadId << 2) + triIndices.z;
+
+    Vertex V0 = terrainData[idx0];
+    Vertex V1 = terrainData[idx1];
+    Vertex V2 = terrainData[idx2];
+
+    vec2 uv0 = decodeVertexUV(V0);
+    vec2 uv1 = decodeVertexUV(V1);
+    vec2 uv2 = decodeVertexUV(V2);
+    // Hardware-clipped, perspective-correct UV from mesh shader (immune to frustum-clipping distortion)
+    vec2 uv = nv_in.v_uv;
+
+    float lodBias = (((gl_PrimitiveID >> 2) & 1) != 0) ? -8.0 : -0.35;
+    vec4 texSample = texture(tex_diffuse, uv, lodBias);
+
+    float alphaCutoff = getVertexAlphaCutoff(uint(gl_PrimitiveID) & 3u);
+    if (texSample.a < alphaCutoff) {
         discard;
     }
 
-    // Convert sRGB block texture + vertex AO/tint to linear space
-    vec3 srgbAlbedo = texSample.rgb * v_VertexColor.rgb;
-    vec3 linearAlbedo = pow(max(srgbAlbedo, vec3(0.0)), vec3(2.2));
+    // Decode positions & exact geometric face normal
+    vec3 pos0 = decodeVertexPosition(V0);
+    vec3 pos1 = decodeVertexPosition(V1);
+    vec3 pos2 = decodeVertexPosition(V2);
 
-    // Geometric normal fallback if vertex normal is not supplied
-    vec3 N = v_Normal;
-    if (dot(N, N) < 0.001) {
-        vec3 dpdx = dFdx(v_WorldPos);
-        vec3 dpdy = dFdy(v_WorldPos);
-        N = normalize(cross(dpdx, dpdy));
-    } else {
-        N = normalize(N);
+    vec3 edge1 = pos1 - pos0;
+    vec3 edge2 = pos2 - pos0;
+    vec3 geomNormal = cross(edge1, edge2);
+    float geomLen = length(geomNormal);
+    geomNormal = (geomLen > 1.0e-6) ? (geomNormal / geomLen) : vec3(0.0, 1.0, 0.0);
+    if (!gl_FrontFacing) {
+        geomNormal = -geomNormal;
     }
 
-    float roughness = deriveRoughness(linearAlbedo, v_TexCoord);
-    float metallic  = deriveMetallic(linearAlbedo);
+    // Separate hardware-clipped vertex color into normalized biome tint and smooth vertex AO
+    vec3 rawVCol = nv_in.v_color;
 
-    vec2 lightLevels = clamp(v_LightCoord, vec2(0.0), vec2(1.0));
-    float emission   = deriveEmission(srgbAlbedo, lightLevels.x);
+    float maxChannel = max(rawVCol.r, max(rawVCol.g, rawVCol.b));
+    vec3 normalizedTint = (maxChannel > 1.0e-4) ? (rawVCol / maxChannel) : vec3(1.0);
+    // Undo vanilla's baked cardinal face shade (0.5 bottom, 0.6 N/S, 0.8 E/W, 1.0 top) so deferred PBR shades faces physically
+    float vanillaFaceFactor = (geomNormal.y < -0.5) ? 0.5 : ((abs(geomNormal.y) > 0.5) ? 1.0 : ((abs(geomNormal.z) > 0.5) ? 0.6 : 0.8));
+    float vertexAO = clamp(maxChannel / max(vanillaFaceFactor, 0.5), 0.15, 1.0);
 
-    // Attachment 0: RGB = Linear Albedo, A = Roughness [0.04, 1.0]
-    outAlbedoRoughness = vec4(linearAlbedo, roughness);
+    vec3 srgbAlbedo = texSample.rgb * normalizedTint;
+    vec3 linearAlbedo = pow(max(srgbAlbedo, vec3(0.0)), vec3(2.2));
 
-    // Attachment 1: RGB = Encoded Normal [0, 1], A = Metalness [0.0, 1.0]
-    outNormalMetallic  = vec4(N * 0.5 + 0.5, metallic);
+    // Decode hardware-clipped lightmap UV & block material ID
+    vec2 lightUV = nv_in.v_lightUV;
+    float blockLight = clamp((lightUV.x - 0.03125) / 0.9375, 0.0, 1.0);
+    float skyLight   = clamp((lightUV.y - 0.03125) / 0.9375, 0.0, 1.0);
 
-    // Attachment 2: R = Block Light, G = Sky Light, B = Emission, A = Terrain Flag (1.0)
-    outLightEmission   = vec4(lightLevels.x, lightLevels.y, emission, 1.0);
+    uint materialId = decodeVertexMaterial(V0);
+    vec4 labSpec = texture(tex_specular, uv, lodBias);
+    MaterialProperties mat = evaluateBlockMaterial(materialId, linearAlbedo, labSpec, lightUV);
+
+    // Construct tangent frame (T, B, N) for LabPBR normal mapping when a LabPBR pack is active
+    vec3 worldNormal = geomNormal;
+    float bumpStrength = max(0.0, OPT_NORMAL_BUMP_STRENGTH);
+    if (bumpStrength > 0.01) {
+        vec4 labNorm = texture(tex_normal, uv, lodBias);
+        vec2 labXY = labNorm.rg * 2.0 - 1.0;
+
+        if (dot(labXY, labXY) > 0.002) {
+            vec2 duv1 = uv1 - uv0;
+            vec2 duv2 = uv2 - uv0;
+            float det = duv1.x * duv2.y - duv2.x * duv1.y;
+            vec3 T;
+            vec3 B;
+            if (abs(det) > 1.0e-7) {
+                float invDet = 1.0 / det;
+                T = normalize((edge1 * duv2.y - edge2 * duv1.y) * invDet);
+                B = normalize((edge2 * duv1.x - edge1 * duv2.x) * invDet);
+            } else {
+                vec3 upRef = abs(geomNormal.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+                T = normalize(cross(upRef, geomNormal));
+                B = cross(geomNormal, T);
+            }
+            labXY *= bumpStrength;
+            float nz = sqrt(max(1.0 - dot(labXY, labXY), 0.01));
+            worldNormal = normalize(T * labXY.x + B * labXY.y + geomNormal * nz);
+            float texAO = clamp(labNorm.b, 0.25, 1.0);
+            vertexAO *= texAO;
+        }
+    }
+
+    // Outdoor rain wetness & porous darkening
+    float wetness = u_Weather.y;
+    if (wetness > 0.01 && OPT_RAIN_PUDDLES > 0.5 && skyLight > 0.65 && materialId != MAT_LAVA && materialId != MAT_EMISSIVE) {
+        float outdoorMask = smoothstep(0.65, 0.92, skyLight);
+        float upFacing = clamp(geomNormal.y, 0.0, 1.0);
+        float surfaceWet = wetness * outdoorMask * (0.35 + 0.65 * upFacing);
+
+        // Wet porous darkening (wet stone, dirt, wood, sand look darker and richer)
+        linearAlbedo *= mix(1.0, 1.0 - mat.porosity * 0.38, surfaceWet);
+        mat.roughness = mix(mat.roughness, 0.07, surfaceWet * 0.82);
+        worldNormal = normalize(mix(worldNormal, geomNormal, surfaceWet * 0.55));
+    }
+
+    outAlbedoRoughness = vec4(linearAlbedo, clamp(mat.roughness, 0.02, 1.0));
+    outNormalMetallic  = vec4(worldNormal, packMetallicAndMaterial(mat.metallic, mat.materialId));
+    outLightEmission   = vec4(blockLight, skyLight, mat.emissive, clamp(vertexAO, 0.0, 1.0));
 }
