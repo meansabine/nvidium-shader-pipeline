@@ -72,8 +72,11 @@ float sampleSingleCascadePCF(
     float layer = float(cascadeIdx);
 
     float shadowSum = 0.0;
+    float cRot = cos(rotAngle);
+    float sRot = sin(rotAngle);
+    mat2 diskRot = mat2(cRot, -sRot, sRot, cRot);
     for (int i = 0; i < 9; i++) {
-        vec2 offset = PCF_DISK_9[i] * texelSize * radiusTexels;
+        vec2 offset = (diskRot * PCF_DISK_9[i]) * texelSize * radiusTexels;
         shadowSum += sampleShadowBilinear(csmArray, uv + offset, layer, refDepth) * PCF_WEIGHTS_9[i];
     }
     return shadowSum;
@@ -111,7 +114,8 @@ float evaluateCascadedShadow(
     }
     outCascadeIdx = cascadeIdx;
 
-    float rotAngle = 0.0;
+    float taaPhase = (u_DebugParams.y > 0.5) ? mod(u_Time.z, 8.0) : 0.0;
+    float rotAngle = interleavedGradientNoise(pixelCoord, taaPhase) * TAU;
     float shadow = sampleSingleCascadePCF(csmArray, camRelPos, worldNormal, lightDir, cascadeIdx, filterScale, rotAngle);
 
     // Smooth blend across cascade boundaries so seams are invisible

@@ -85,6 +85,17 @@ public class SceneUniforms {
     private float smoothedHeldLight = 0.0f;
     private final Vector3f smoothedHeldColor = new Vector3f(1.0f, 0.72f, 0.38f);
 
+    // Halton(2,3) 8-sample sub-pixel jitter sequence for TAA
+    private static final float[] HALTON_X = new float[] {
+             0.0000f, -0.2500f,  0.2500f, -0.3750f,  0.1250f, -0.1250f,  0.3750f, -0.4375f
+    };
+    private static final float[] HALTON_Y = new float[] {
+            -0.1667f,  0.1667f, -0.3889f, -0.0556f,  0.2778f, -0.2778f,  0.0556f,  0.3889f
+    };
+    private float prevJitterUvX = 0.0f;
+    private float prevJitterUvY = 0.0f;
+    private float lastRenderTimeSec = 0.0f;
+
     public SceneUniforms() {
         this.rawBuffer = MemoryUtil.memCalloc(BUFFER_SIZE);
         this.floatBuffer = rawBuffer.asFloatBuffer();
@@ -379,6 +390,13 @@ public class SceneUniforms {
         // [208..212] u_CameraDelta (offset 832)
         putVec4(208, camDeltaX, camDeltaY, camDeltaZ, hasPrevFrame ? 1.0f : 0.0f);
 
+        // [212..216] u_TaaJitter (offset 848): xy = current Halton(2,3) sub-pixel UV jitter, zw = previous frame UV jitter
+        int haltonIdx = frameCounter & 7;
+        float curJitterUvX = (cfg.taaEnabled && cfg.debugMode == 0) ? (HALTON_X[haltonIdx] / w) : 0.0f;
+        float curJitterUvY = (cfg.taaEnabled && cfg.debugMode == 0) ? (HALTON_Y[haltonIdx] / h) : 0.0f;
+        putVec4(212, curJitterUvX, curJitterUvY, prevJitterUvX, prevJitterUvY);
+
+        this.lastRenderTimeSec = renderTimeSec;
         uploadAndBind();
 
         if (packOptionsUbo != null) {
@@ -390,7 +408,13 @@ public class SceneUniforms {
         prevCamX = camX;
         prevCamY = camY;
         prevCamZ = camZ;
+        prevJitterUvX = curJitterUvX;
+        prevJitterUvY = curJitterUvY;
         hasPrevFrame = true;
+    }
+
+    public float getLastRenderTimeSec() {
+        return lastRenderTimeSec;
     }
 
     public void updateCascadesInUbo(Matrix4f c0, Matrix4f c1, Matrix4f c2, float s0, float s1, float s2) {

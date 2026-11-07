@@ -8,12 +8,14 @@ import net.nvidium.shaders.config.PipelineConfig;
 import net.nvidium.shaders.pack.ShaderPackManager;
 import net.nvidium.shaders.pipeline.gbuffer.GBuffer;
 import net.nvidium.shaders.pipeline.gl.FullscreenQuad;
+import net.nvidium.shaders.pipeline.gl.GlStateRestore;
 import net.nvidium.shaders.pipeline.passes.*;
 import net.nvidium.shaders.pipeline.shadow.CascadedShadowMap;
 import net.nvidium.shaders.pipeline.targets.HdrTargets;
 import net.nvidium.shaders.pipeline.targets.SceneCopyTargets;
 import net.nvidium.shaders.pipeline.textures.PbrAtlasHooks;
 import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
+import net.nvidium.shaders.pipeline.uniforms.PointLightUniforms;
 import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
 
 import java.util.ArrayList;
@@ -37,6 +39,7 @@ public class PipelineManager {
     private SceneCopyTargets sceneCopyTargets;
     private SceneUniforms sceneUniforms;
     private PackOptionsUniforms packOptionsUniforms;
+    private PointLightUniforms pointLightUniforms;
     private PbrAtlasHooks pbrHooks;
 
     // Active passes
@@ -78,12 +81,13 @@ public class PipelineManager {
         sceneCopyTargets = new SceneCopyTargets(width, height);
         sceneUniforms = new SceneUniforms();
         packOptionsUniforms = new PackOptionsUniforms();
+        pointLightUniforms = new PointLightUniforms();
         pbrHooks = new PbrAtlasHooks();
 
         // 2. Initialize passes
         shadowPass = new ShadowPass(csm, sceneUniforms, packOptionsUniforms);
         gBufferPass = new GBufferPass(gBuffer, sceneUniforms, packOptionsUniforms, pbrHooks);
-        deferredLightingPass = new DeferredLightingPass(gBuffer, csm, hdrTargets, sceneUniforms, packOptionsUniforms);
+        deferredLightingPass = new DeferredLightingPass(gBuffer, csm, hdrTargets, sceneUniforms, packOptionsUniforms, pointLightUniforms);
         volumetricFogPass = new VolumetricFogPass(csm, hdrTargets, sceneUniforms, packOptionsUniforms);
         waterTranslucentPass = new WaterTranslucentPass(sceneCopyTargets, csm, sceneUniforms, packOptionsUniforms, pbrHooks);
         postProcessPass = new PostProcessPass(gBuffer, hdrTargets, sceneCopyTargets, sceneUniforms, packOptionsUniforms);
@@ -117,6 +121,9 @@ public class PipelineManager {
             onResize(w, h);
         }
         sceneUniforms.updateFromFrame(ctx, packOptionsUniforms);
+        if (pointLightUniforms != null) {
+            pointLightUniforms.updateFromFrame(ctx, sceneUniforms.getLastRenderTimeSec());
+        }
     }
 
     public void executeShadowPass(INvidiumShaderHook.ShadowPassContext shadowCtx, RenderContext ctx) {
@@ -169,11 +176,15 @@ public class PipelineManager {
         if (postProcessPass != null && postProcessPass.isEnabled()) {
             postProcessPass.execute(ctx);
         }
+        GlStateRestore.restoreAfterPass(ctx.getScreenWidth(), ctx.getScreenHeight());
     }
 
     public void executePreTranslucent(RenderContext ctx) {
         if (initialized && waterTranslucentPass != null && waterTranslucentPass.isEnabled()) {
             waterTranslucentPass.execute(ctx);
+        }
+        if (pointLightUniforms != null) {
+            pointLightUniforms.bindUnified();
         }
     }
 
@@ -181,6 +192,7 @@ public class PipelineManager {
         if (initialized && postProcessPass != null && postProcessPass.isEnabled()) {
             postProcessPass.executeFinalComposite(ctx);
         }
+        GlStateRestore.restoreAfterPass(ctx.getScreenWidth(), ctx.getScreenHeight());
     }
 
     public synchronized void onResize(int width, int height) {
@@ -218,6 +230,7 @@ public class PipelineManager {
         if (sceneCopyTargets != null) { sceneCopyTargets.delete(); sceneCopyTargets = null; }
         if (sceneUniforms != null) { sceneUniforms.delete(); sceneUniforms = null; }
         if (packOptionsUniforms != null) { packOptionsUniforms.delete(); packOptionsUniforms = null; }
+        if (pointLightUniforms != null) { pointLightUniforms.delete(); pointLightUniforms = null; }
         if (pbrHooks != null) { pbrHooks.delete(); pbrHooks = null; }
 
         FullscreenQuad.destroy();

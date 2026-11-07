@@ -131,29 +131,64 @@ vec3 evaluateAtmosphericHazeSky(vec3 V, float haziness) {
 }
 
 /**
+ * Anti-aliased 3D Voronoi starfield on the celestial sphere.
+ */
+vec3 evaluateCelestialStars(vec3 rayDir, float starDensity, float brightness) {
+    vec3 p = rayDir * starDensity;
+    vec3 cell = floor(p);
+    vec3 frac = fract(p) - 0.5;
+
+    float h = hash13(cell);
+    float threshold = 0.965;
+    if (h <= threshold) {
+        return vec3(0.0);
+    }
+
+    vec3 starOffset = (vec3(
+            hash13(cell + vec3(13.7, 5.3, 9.1)),
+            hash13(cell + vec3(29.3, 41.1, 17.7)),
+            hash13(cell + vec3(53.9, 11.3, 37.5))
+    ) - 0.5) * 0.55;
+
+    float dist = length(frac - starOffset);
+    float spot = smoothstep(0.22, 0.03, dist);
+    if (spot <= 0.001) {
+        return vec3(0.0);
+    }
+
+    float mag = (h - threshold) / (1.0 - threshold);
+    float twinkle = 0.72 + 0.28 * sin(u_Time.x * (2.5 + mag * 3.0) + h * 157.0);
+    vec3 starTint = mix(vec3(0.70, 0.84, 1.00), vec3(1.00, 0.86, 0.68), fract(h * 91.7));
+    return starTint * spot * (0.4 + mag * 1.8) * twinkle * brightness;
+}
+
+/**
  * Evaluates full physical sky, solar/lunar disks, stars, and clouds along view direction V.
  * Used for sky background pixels (depth >= 0.99999) and sharp specular mirror/water reflections.
  */
 vec3 evaluatePhysicalSky(vec3 V, float cloudMode, float cloudCoverage, float haziness) {
     int dimId = int(round(u_FogParams.w));
     if (dimId == -1) {
-        // Nether smoky ember gradient
+        // Nether volumetric ember & volcanic ash dome
         float h = clamp(V.y * 0.5 + 0.5, 0.0, 1.0);
-        vec3 base = mix(vec3(0.38, 0.07, 0.02), vec3(0.14, 0.02, 0.01), h);
-        float smoke = fbm2D(V.xz * 3.0 + u_Time.x * 0.15);
-        return base + vec3(0.18, 0.04, 0.01) * smoke;
+        vec3 crimsonBase = mix(vec3(0.42, 0.08, 0.025), vec3(0.14, 0.025, 0.012), h);
+        vec2 plumeUV = V.xz / max(abs(V.y) + 0.35, 0.35);
+        float smokeA = fbm2D(plumeUV * 2.2 + vec2(u_Time.x * 0.08, -u_Time.x * 0.05));
+        float smokeB = fbm2D(plumeUV * 4.5 - vec2(u_Time.x * 0.12, u_Time.x * 0.09));
+        float emberGlow = smoothstep(0.42, 0.85, smokeA * 0.65 + smokeB * 0.35);
+        return crimsonBase + vec3(0.32, 0.09, 0.02) * emberGlow * (1.0 - h * 0.45);
     }
     if (dimId == 1) {
-        // End cosmic void nebula & stars
-        vec3 base = mix(vec3(0.08, 0.04, 0.14), vec3(0.02, 0.01, 0.04), clamp(abs(V.y), 0.0, 1.0));
-        float nebula = fbm2D(V.xz / max(abs(V.y) + 0.25, 0.25) * 1.8 + u_Time.x * 0.03);
-        base += vec3(0.22, 0.09, 0.35) * smoothstep(0.45, 0.85, nebula) * 0.65;
-        vec3 starCell = floor(V * 240.0);
-        float starHash = hash13(starCell);
-        if (starHash > 0.9965) {
-            base += vec3(0.75, 0.85, 1.0) * (starHash - 0.9965) * 450.0;
-        }
-        return base;
+        // The End cosmic void nebula & 3D Voronoi starfield
+        float absY = clamp(abs(V.y), 0.0, 1.0);
+        vec3 voidBase = mix(vec3(0.07, 0.035, 0.13), vec3(0.015, 0.008, 0.035), absY);
+        vec2 nebUV = V.xz / max(absY + 0.28, 0.28);
+        float neb1 = fbm2D(nebUV * 1.6 + vec2(u_Time.x * 0.02, -u_Time.x * 0.015));
+        float neb2 = fbm2D(nebUV * 3.1 - vec2(u_Time.x * 0.025, u_Time.x * 0.02) + neb1 * 0.65);
+        vec3 purpleNebula = vec3(0.26, 0.08, 0.42) * smoothstep(0.42, 0.82, neb1);
+        vec3 tealFilament = vec3(0.06, 0.24, 0.28) * smoothstep(0.55, 0.88, neb2) * 0.65;
+        vec3 endStars = evaluateCelestialStars(normalize(V), 95.0, 1.85);
+        return voidBase + (purpleNebula + tealFilament) * (1.0 - absY * 0.35) + endStars;
     }
 
     vec3 sunDir = normalize(u_SunDirection.xyz);
@@ -191,30 +226,29 @@ vec3 evaluatePhysicalSky(vec3 V, float cloudMode, float cloudCoverage, float haz
         float sunCorona = pow(clamp(cosSun, 0.0, 1.0), 96.0) * 1.4;
         skyGrad += u_SunColor.rgb * (sunDisk * 18.0 + sunCorona) * (1.0 - rain * 0.9);
 
-        // Lunar disk with procedural craters
+        // Lunar disk with procedural craters and phase shading
         float moonDisk = smoothstep(0.9992, 0.99965, cosMoon);
         if (moonDisk > 0.001) {
             float craters = fbm2D(V.xy * 120.0 + V.z * 80.0);
-            vec3 moonSurface = u_MoonColor.rgb * mix(0.65, 1.15, craters) * 6.5;
+            float phaseLit = clamp(u_MoonDirection.w, 0.25, 1.0);
+            vec3 moonSurface = u_MoonColor.rgb * mix(0.65, 1.15, craters) * 6.5 * phaseLit;
             skyGrad += moonSurface * moonDisk * (1.0 - rain * 0.9);
         }
     }
 
-    // Night stars & subtle Milky Way band
+    // Overworld Night Starfield (rotates smoothly with celestial sphere) & Milky Way band
     if (nightFactor > 0.05 && V.y > 0.02 && rain < 0.85) {
-        float starVis = nightFactor * (1.0 - rain) * smoothstep(0.02, 0.25, V.y);
-        vec3 starDir = normalize(V + vec3(u_Time.y * 0.25, 0.0, 0.0));
-        vec3 cell = floor(starDir * 290.0);
-        float h = hash13(cell);
-        if (h > 0.9958) {
-            float twinkle = 0.65 + 0.35 * sin(u_Time.x * 3.5 + h * 100.0);
-            vec3 starTint = mix(vec3(0.75, 0.86, 1.0), vec3(1.0, 0.88, 0.72), fract(h * 73.1));
-            skyGrad += starTint * (h - 0.9958) * 380.0 * starVis * twinkle;
-        }
+        float starVis = nightFactor * (1.0 - rain) * smoothstep(0.02, 0.22, V.y);
+        float angle = u_Time.y * TAU;
+        float ca = cos(angle);
+        float sa = sin(angle);
+        vec3 rotV = vec3(V.x * ca - V.y * sa, V.x * sa + V.y * ca, V.z);
+        skyGrad += evaluateCelestialStars(rotV, 85.0, starVis * 2.2);
+
         // Milky way glow band
-        float galaxyBand = exp(-pow((V.x * 0.7 + V.z * 0.7) * 2.8, 2.0));
-        float galaxyDust = fbm2D(V.xz * 4.5);
-        skyGrad += vec3(0.03, 0.05, 0.10) * galaxyBand * galaxyDust * starVis;
+        float galaxyBand = exp(-pow((rotV.x * 0.65 + rotV.z * 0.75) * 2.6, 2.0));
+        float galaxyDust = fbm2D(rotV.xz * 4.2);
+        skyGrad += vec3(0.035, 0.055, 0.11) * galaxyBand * galaxyDust * starVis;
     }
 
     // Composite volumetric / planar clouds over sky

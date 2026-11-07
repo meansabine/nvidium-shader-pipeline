@@ -31,7 +31,8 @@ float computeHorizonGTAO(vec2 uv, vec3 camRelPos, vec3 worldNormal, float vertex
 
     vec2 texel = u_ScreenSize.zw;
     float radiusPixels = clamp(22.0 / max(viewDist * 0.35, 1.0), 3.0, 18.0);
-    float noise = interleavedGradientNoise(gl_FragCoord.xy, 0.0);
+    float taaPhase = (u_DebugParams.y > 0.5) ? mod(u_Time.z, 8.0) : 0.0;
+    float noise = interleavedGradientNoise(gl_FragCoord.xy, taaPhase);
     float baseAngle = noise * HALF_PI;
 
     float occlusion = 0.0;
@@ -292,7 +293,7 @@ void main() {
         totalLighting += albedo * u_SunColor.rgb * caustics * shadowFactor * skyLight * 0.55;
     }
 
-    // 6. Handheld Colored Dynamic Point Light
+    // 6. Handheld Colored Dynamic Point Light & World Colored Emissive Point Lights (PointLightUniforms)
     float heldLightLevel = u_Environment.z;
     if (heldLightLevel > 0.05 && OPT_HANDHELD_DYNAMIC_LIGHT > 0.5) {
         // Light source slightly offset to player's hand position
@@ -309,6 +310,26 @@ void main() {
             vec3 handRadiance = u_HeldLightColor.rgb * (heldLightLevel / 15.0) * 3.2 * rangeAtten * invSq * flicker;
 
             totalLighting += evaluateDirectPBR(N, viewToCam, L_hand, albedo, roughness, metallic, subsurface * 0.5, handRadiance);
+        }
+    }
+
+    int pointLightCount = clamp(int(round(u_PointLightMeta.x)), 0, MAX_POINT_LIGHTS);
+    if (pointLightCount > 0 && viewDist < 42.0) {
+        float distFade = smoothstep(42.0, 26.0, viewDist);
+        for (int i = 0; i < pointLightCount; i++) {
+            vec4 posRad = u_PointLightPosRadius[i];
+            vec3 toPt = posRad.xyz - camRelPos;
+            float radius = max(1.0, posRad.w);
+            float d2 = dot(toPt, toPt);
+            if (d2 < radius * radius) {
+                float d = sqrt(max(d2, 0.06));
+                vec3 L_pt = toPt / d;
+                vec4 colInt = u_PointLightColor[i];
+                float window = pow(clamp(1.0 - (d2 / (radius * radius)), 0.0, 1.0), 2.0);
+                float atten = window / (1.0 + 0.35 * d + 0.22 * d2);
+                vec3 ptRadiance = colInt.rgb * (colInt.w * atten * distFade * 1.35);
+                totalLighting += evaluateDirectPBR(N, viewToCam, L_pt, albedo, roughness, metallic, subsurface * 0.35, ptRadiance);
+            }
         }
     }
 

@@ -84,7 +84,11 @@ void main() {
     float bloomStrength = u_PostParams.y;
     vec3 bloom = (bloomStrength > 0.001) ? computeMultiOctaveBloom(v_TexCoord) : vec3(0.0);
 
-    vec3 currSrgb = resolveCurrentPixelSrgb(v_TexCoord, bloom);
+    // Apply Halton(2,3) sub-pixel sampling offset when TAA is active
+    bool taaEnabled = (u_DebugParams.y > 0.5) && (u_CameraDelta.w > 0.5) && (u_DebugParams.x < 0.5);
+    vec2 sampleUV = taaEnabled ? clamp(v_TexCoord + u_TaaJitter.xy * 0.45, vec2(0.0005), vec2(0.9995)) : v_TexCoord;
+
+    vec3 currSrgb = resolveCurrentPixelSrgb(sampleUV, bloom);
 
     // Debug modes bypass TAA
     if (u_DebugParams.x > 0.5) {
@@ -93,7 +97,6 @@ void main() {
     }
 
     // Temporal Accumulation / Anti-Aliasing (TAA) with 3x3 YCoCg Variance Clipping
-    bool taaEnabled = (u_DebugParams.y > 0.5) && (u_CameraDelta.w > 0.5);
     if (taaEnabled) {
         float depth = textureLod(gDepth, v_TexCoord, 0.0).r;
         vec3 camRelPos = reconstructCameraRelativePos(v_TexCoord, depth);
@@ -120,7 +123,7 @@ void main() {
                 vec3 sigma = sqrt(max(m2 - m1 * m1, vec3(1.0e-6)));
 
                 float motionPixels = length((prevUV - v_TexCoord) * u_ScreenSize.xy);
-                float gammaBox = mix(1.35, 0.80, clamp(motionPixels / 12.0, 0.0, 1.0));
+                float gammaBox = mix(1.28, 0.78, clamp(motionPixels / 12.0, 0.0, 1.0));
 
                 vec3 boxMin = m1 - gammaBox * sigma;
                 vec3 boxMax = m1 + gammaBox * sigma;
@@ -128,7 +131,7 @@ void main() {
                 vec3 histYcc = clamp(rgbToYCoCg(historySrgb), boxMin, boxMax);
                 vec3 clampedHistory = clamp(yCoCgToRgb(histYcc), 0.0, 1.0);
 
-                float blendWeight = mix(0.86, 0.62, clamp(motionPixels / 16.0, 0.0, 1.0));
+                float blendWeight = mix(0.86, 0.60, clamp(motionPixels / 16.0, 0.0, 1.0));
                 currSrgb = mix(currSrgb, clampedHistory, blendWeight);
             }
         }

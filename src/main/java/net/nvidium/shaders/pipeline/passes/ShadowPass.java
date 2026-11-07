@@ -6,6 +6,7 @@ import me.cortex.nvidium.gl.shader.Shader;
 import net.nvidium.shaders.pack.NvidiumShaderPrograms;
 import net.nvidium.shaders.pack.ShaderPack;
 import net.nvidium.shaders.pack.ShaderPackManager;
+import net.nvidium.shaders.pipeline.gl.GlStateRestore;
 import net.nvidium.shaders.pipeline.shadow.CascadedShadowMap;
 import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
 import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
@@ -91,8 +92,7 @@ public class ShadowPass implements IShaderPass {
         GL11C.glColorMask(true, true, true, true);
         GL11C.glViewport(0, 0, ctx.getScreenWidth(), ctx.getScreenHeight());
 
-        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
-        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+        GlStateRestore.invalidateTextureUnits();
     }
 
     @Override

@@ -11,6 +11,7 @@ import net.nvidium.shaders.pipeline.gl.ShaderProgram;
 import net.nvidium.shaders.pipeline.shadow.CascadedShadowMap;
 import net.nvidium.shaders.pipeline.targets.HdrTargets;
 import net.nvidium.shaders.pipeline.uniforms.PackOptionsUniforms;
+import net.nvidium.shaders.pipeline.uniforms.PointLightUniforms;
 import net.nvidium.shaders.pipeline.uniforms.SceneUniforms;
 import org.lwjgl.opengl.GL11C;
 import org.lwjgl.opengl.GL13C;
@@ -26,6 +27,7 @@ public class DeferredLightingPass implements IShaderPass {
     private final HdrTargets hdrTargets;
     private final SceneUniforms sceneUniforms;
     private final PackOptionsUniforms packOptionsUniforms;
+    private final PointLightUniforms pointLightUniforms;
 
     private ShaderProgram lightingProgram;
     private boolean enabled = true;
@@ -35,12 +37,14 @@ public class DeferredLightingPass implements IShaderPass {
             CascadedShadowMap csm,
             HdrTargets hdrTargets,
             SceneUniforms sceneUniforms,
-            PackOptionsUniforms packOptionsUniforms) {
+            PackOptionsUniforms packOptionsUniforms,
+            PointLightUniforms pointLightUniforms) {
         this.gBuffer = gBuffer;
         this.csm = csm;
         this.hdrTargets = hdrTargets;
         this.sceneUniforms = sceneUniforms;
         this.packOptionsUniforms = packOptionsUniforms;
+        this.pointLightUniforms = pointLightUniforms;
     }
 
     @Override
@@ -62,6 +66,9 @@ public class DeferredLightingPass implements IShaderPass {
 
         sceneUniforms.bindStandard();
         packOptionsUniforms.bindStandard();
+        if (pointLightUniforms != null) {
+            pointLightUniforms.bindStandard();
+        }
 
         lightingProgram.bind();
 

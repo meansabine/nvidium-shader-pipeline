@@ -7,6 +7,7 @@ import net.nvidium.shaders.pack.ShaderPack;
 import net.nvidium.shaders.pack.ShaderPackManager;
 import net.nvidium.shaders.pipeline.gbuffer.GBuffer;
 import net.nvidium.shaders.pipeline.gl.FullscreenQuad;
+import net.nvidium.shaders.pipeline.gl.GlStateRestore;
 import net.nvidium.shaders.pipeline.gl.ShaderProgram;
 import net.nvidium.shaders.pipeline.targets.HdrTargets;
 import net.nvidium.shaders.pipeline.targets.SceneCopyTargets;
@@ -105,11 +106,7 @@ public class PostProcessPass implements IShaderPass {
 
         hdrTargets.swapHistory();
 
-        GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, mcTarget.frameBufferId);
-        GL11C.glDepthMask(true);
-        GL11C.glEnable(GL11C.GL_DEPTH_TEST);
-        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
-        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+        GlStateRestore.restoreAfterPass(w, h);
     }
 
     public void executeFinalComposite(RenderContext ctx) {
@@ -119,8 +116,8 @@ public class PostProcessPass implements IShaderPass {
         int h = ctx.getScreenHeight();
         RenderTarget mcTarget = Minecraft.getInstance().getMainRenderTarget();
 
-        // Copy current mcTarget color (including entities & translucent water/glass) to sceneCopyTargets
-        sceneCopyTargets.copyFromFbo(mcTarget.frameBufferId, mcTarget.getDepthTextureId(), true, false, false);
+        // Copy current mcTarget color and depth (including entities & translucent water/glass) to sceneCopyTargets
+        sceneCopyTargets.copyFromFbo(mcTarget.frameBufferId, mcTarget.getDepthTextureId(), true, true, false);
 
         GL30C.glBindFramebuffer(GL30C.GL_FRAMEBUFFER, mcTarget.frameBufferId);
         GL11C.glViewport(0, 0, w, h);
@@ -135,7 +132,7 @@ public class PostProcessPass implements IShaderPass {
         finalCompositeProgram.bind();
 
         GL45C.glBindTextureUnit(0, sceneCopyTargets.getColorCopyTex());
-        GL45C.glBindTextureUnit(1, mcTarget.getDepthTextureId());
+        GL45C.glBindTextureUnit(1, sceneCopyTargets.getDepthCopyTex());
         GL45C.glBindTextureUnit(2, gBuffer.getNormalMetallicTex());
         GL45C.glBindTextureUnit(3, gBuffer.getLightEmissionTex());
 
@@ -143,13 +140,7 @@ public class PostProcessPass implements IShaderPass {
 
         finalCompositeProgram.unbind();
 
-        GL11C.glDepthMask(true);
-        Gl11RestoreState();
-    }
-
-    private void Gl11RestoreState() {
-        GlStateManager._activeTexture(GL13C.GL_TEXTURE0);
-        GL13C.glActiveTexture(GL13C.GL_TEXTURE0);
+        GlStateRestore.restoreAfterPass(w, h);
     }
 
     @Override

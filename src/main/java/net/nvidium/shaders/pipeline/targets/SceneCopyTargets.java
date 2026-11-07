@@ -49,26 +49,26 @@ public class SceneCopyTargets {
             GL45C.glNamedFramebufferTexture(copyFbo, GL30C.GL_DEPTH_STENCIL_ATTACHMENT, 0, 0);
             GL11C.glDeleteTextures(depthCopyTex);
         }
-        this.depthInternalFormat = internalFormat != 0 ? internalFormat : GL11C.GL_DEPTH_COMPONENT;
-        depthCopyTex = GL11C.glGenTextures();
-        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, depthCopyTex);
+        int resolvedFormat = internalFormat;
+        if (resolvedFormat == 0 || resolvedFormat == GL11C.GL_DEPTH_COMPONENT) {
+            resolvedFormat = GL30C.GL_DEPTH_COMPONENT32F;
+        } else if (resolvedFormat == GL30C.GL_DEPTH_STENCIL) {
+            resolvedFormat = GL30C.GL_DEPTH24_STENCIL8;
+        }
+        this.depthInternalFormat = resolvedFormat;
+
+        depthCopyTex = GL45C.glCreateTextures(GL11C.GL_TEXTURE_2D);
+        GL45C.glTextureStorage2D(depthCopyTex, 1, this.depthInternalFormat, width, height);
+        GL45C.glTextureParameteri(depthCopyTex, GL11C.GL_TEXTURE_MIN_FILTER, GL11C.GL_NEAREST);
+        GL45C.glTextureParameteri(depthCopyTex, GL11C.GL_TEXTURE_MAG_FILTER, GL11C.GL_NEAREST);
+        GL45C.glTextureParameteri(depthCopyTex, GL11C.GL_TEXTURE_WRAP_S, GL12C.GL_CLAMP_TO_EDGE);
+        GL45C.glTextureParameteri(depthCopyTex, GL11C.GL_TEXTURE_WRAP_T, GL12C.GL_CLAMP_TO_EDGE);
+        GL45C.glTextureParameteri(depthCopyTex, GL14C.GL_TEXTURE_COMPARE_MODE, GL11C.GL_NONE);
 
         boolean hasStencil = (this.depthInternalFormat == GL30C.GL_DEPTH24_STENCIL8
-                || this.depthInternalFormat == GL30C.GL_DEPTH32F_STENCIL8
-                || this.depthInternalFormat == GL30C.GL_DEPTH_STENCIL);
-        int format = hasStencil ? GL30C.GL_DEPTH_STENCIL : GL11C.GL_DEPTH_COMPONENT;
-        int type = hasStencil ? GL30C.GL_UNSIGNED_INT_24_8 : GL11C.GL_FLOAT;
-
-        GL11C.glTexImage2D(GL11C.GL_TEXTURE_2D, 0, this.depthInternalFormat, width, height, 0, format, type, 0L);
-        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_MIN_FILTER, GL11C.GL_NEAREST);
-        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_MAG_FILTER, GL11C.GL_NEAREST);
-        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_WRAP_S, GL12C.GL_CLAMP_TO_EDGE);
-        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL11C.GL_TEXTURE_WRAP_T, GL12C.GL_CLAMP_TO_EDGE);
-        GL11C.glTexParameteri(GL11C.GL_TEXTURE_2D, GL14C.GL_TEXTURE_COMPARE_MODE, GL11C.GL_NONE);
-
+                || this.depthInternalFormat == GL30C.GL_DEPTH32F_STENCIL8);
         int attachment = hasStencil ? GL30C.GL_DEPTH_STENCIL_ATTACHMENT : GL30C.GL_DEPTH_ATTACHMENT;
         GL45C.glNamedFramebufferTexture(copyFbo, attachment, depthCopyTex, 0);
-        GL11C.glBindTexture(GL11C.GL_TEXTURE_2D, 0);
     }
 
     public void copyFromFbo(int srcFboId, int srcDepthTexId, boolean copyColor, boolean copyDepth, boolean generateColorMips) {

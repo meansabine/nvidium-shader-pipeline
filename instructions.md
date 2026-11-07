@@ -115,6 +115,15 @@ layout(std140, binding = 3) uniform SceneUniforms {
     vec4 u_ShadowParams;          // [800..816] x=shadowRes, y=1/shadowRes, z=ssrEnabled, w=gtaoEnabled
     vec4 u_DebugParams;           // [816..832] x=debugMode, y=taaEnabled, z=casSharpening, w=taaBlendFactor
     vec4 u_CameraDelta;           // [832..848] xyz=currentCamPos - prevCamPos, w=hasPrevFrame
+    vec4 u_TaaJitter;             // [848..864] xy=current Halton(2,3) UV jitter, zw=previous frame UV jitter
+};
+
+const int MAX_POINT_LIGHTS = 64;
+
+layout(std140, binding = 5) uniform PointLightUniforms {
+    vec4 u_PointLightMeta;                     // x=activeCount(0..64), y=maxRadius, z=globalMult, w=timeSec
+    vec4 u_PointLightPosRadius[MAX_POINT_LIGHTS]; // xyz=camera-relative light pos, w=radius
+    vec4 u_PointLightColor[MAX_POINT_LIGHTS];     // rgb=linear color, w=intensity
 };
 ```
 
@@ -667,6 +676,15 @@ layout(std140, binding = 3) uniform SceneUniforms {
     vec4 u_ShadowParams;          // [800..816] x=shadowRes, y=1/shadowRes, z=ssrEnabled, w=gtaoEnabled
     vec4 u_DebugParams;           // [816..832] x=debugMode, y=taaEnabled, z=casSharpening, w=taaBlendFactor
     vec4 u_CameraDelta;           // [832..848] xyz=currentCamPos - prevCamPos, w=hasPrevFrame
+    vec4 u_TaaJitter;             // [848..864] xy=current Halton(2,3) UV jitter, zw=previous frame UV jitter
+};
+
+const int MAX_POINT_LIGHTS = 64;
+
+layout(std140, binding = 5) uniform PointLightUniforms {
+    vec4 u_PointLightMeta;                     // x=activeCount(0..64), y=maxRadius, z=globalMult, w=timeSec
+    vec4 u_PointLightPosRadius[MAX_POINT_LIGHTS]; // xyz=camera-relative light pos, w=radius
+    vec4 u_PointLightColor[MAX_POINT_LIGHTS];     // rgb=linear color, w=intensity
 };
 
 const float PI = 3.14159265359;
